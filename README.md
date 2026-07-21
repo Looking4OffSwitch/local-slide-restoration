@@ -1,196 +1,231 @@
 # Local Slide Restoration
 
-A local, automated pipeline for restoring scanned photographic slides on Apple Silicon Macs. It applies the same deterministic pipeline to every image, regardless of whether the source was captured with a camera and lightbox or digitized with a slide scanner.
+A guarded, local pipeline for restoring scanned photographic slides on:
 
-The pipeline performs:
+- Apple Silicon macOS using PyTorch MPS; and
+- x86-64 Bazzite Linux using an NVIDIA CUDA GPU.
+
+The macOS path was verified on an M2 Max with 32 GB unified memory. The Bazzite path is an initial implementation for a system with an RTX 4080-class GPU, 12 GB VRAM, 64 GB system RAM, and the current Bazzite-provided NVIDIA driver. It must be benchmarked on that PC before production use.
+
+The pipeline applies:
 
 1. EXIF-aware orientation correction.
 2. Conservative, image-adaptive color-cast correction in linear RGB.
 3. Local contrast recovery in LAB color space.
-4. SeedVR2 restoration using the Mac's Metal Performance Shaders (MPS) GPU backend.
+4. SeedVR2 restoration on MPS or CUDA.
 5. LAB perceptual color matching to preserve the source image's identity.
 6. Adaptive, edge-masked sharpening.
 7. Lossless PNG master and high-quality JPEG delivery output.
-8. A JSON manifest containing dimensions, settings, quality metrics, and SHA-256 hashes.
-
-The current release targets macOS on Apple Silicon. It was developed and verified on a MacBook Pro with an M2 Max and 32 GB of unified memory.
+8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
 
 ## Safety: originals are never output targets
 
-This project is designed around a strict non-destructive workflow:
-
-- Never point the output or working directories at your source-photo directory.
-- Copy photographs to a separate input directory before running the pipeline.
-- The program reads copied inputs and writes prepared files, model output, masters, and delivery files to separate directories.
-- It refuses input, output, or work paths inside repository-local `manual/` and `machine/` source directories.
-- It refuses symlinked inputs that resolve back into either protected source directory.
+- Work only with copied photographs. Keep the originals and an independent backup.
+- Never point the output or working directories at the source-photo directory.
+- The pipeline refuses repository-local `manual/` and `machine/` source directories.
+- It refuses symlinked inputs that resolve into either protected directory.
 - It refuses an output or work directory nested beneath the input directory.
-- Source photographs, model files, virtual environments, working files, and outputs are excluded by `.gitignore`.
+- Model files, environments, working files, and image outputs are excluded by `.gitignore`.
 
-Keep an independent backup of irreplaceable photographs. No automated restoration process should be the only custodian of archival material.
+## Restoration profiles
 
-## Requirements
+Both profiles use the pinned 3B SeedVR2 architecture, the same FP16 VAE, the same seed, LAB color matching, tiled VAE encoding/decoding, and native-resolution bucketing.
 
-- Apple Silicon Mac (`arm64`)
-- macOS
-- Git
-- Internet access during installation
-- Approximately 10 GB of free space for the Python environment, SeedVR2 checkout, and model weights, plus working/output space
-- 32 GB unified memory recommended for full-resolution scans
+| Profile | DiT model | CUDA starting configuration | Purpose |
+|---|---|---|---|
+| `archival-fp16` | 3B FP16 | 32 BlockSwap blocks, CPU offload | Highest available model precision; existing Mac default |
+| `balanced-fp8` | 3B FP8 E4M3FN | 16 BlockSwap blocks, CPU offload | SeedVR2's recommended model class for 12–16 GB VRAM |
 
-The installer uses [uv](https://docs.astral.sh/uv/) exclusively to install Python 3.12, create the isolated virtual environment, and synchronize the locked dependencies. It does not invoke `pip` or `python -m venv`.
+The CUDA BlockSwap values are explicit starting configurations, not claims of optimal tuning. The benchmark records them. Do not interpret the FP8/FP16 comparison metrics as a quality score; they measure how different the two outputs are. Visual review determines whether either output is acceptable.
 
-## Installation
+SeedVR2's current hardware guidance is available in the [upstream project documentation](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler#requirements).
 
-Clone the repository and run the idempotent installer:
+## Bazzite requirements
+
+- Current x86-64 Bazzite NVIDIA image
+- Operational Bazzite-provided NVIDIA driver and `nvidia-smi`
+- NVIDIA CUDA-capable GPU; the initial target has 12 GB VRAM
+- 64 GB system RAM for model and tensor offloading on the initial target
+- Git, curl, and internet access during installation
+- At least 20 GB free for the CUDA environment, pinned SeedVR2 checkout, both DiT models, and the VAE, plus separate working/output space
+
+Bazzite supplies and updates NVIDIA drivers as part of its NVIDIA OS images. Do not install or replace the host driver for this pipeline. See the [Bazzite NVIDIA FAQ](https://docs.bazzite.gg/General/FAQ/#are-nvidia-graphics-card-drivers-pre-installed).
+
+The installer uses `uv` in user-writable storage and does not modify Bazzite's read-only system image. PyTorch's locked Linux wheels provide the matching user-space CUDA libraries; the host provides the NVIDIA driver.
+
+## Install on Bazzite
+
+Clone the repository on the Bazzite PC and run:
 
 ```bash
 git clone https://github.com/Looking4OffSwitch/local-slide-restoration.git
 cd local-slide-restoration
-./setup_pipeline.sh
+./setup_bazzite.sh
 ```
 
-The installer:
+The idempotent installer:
 
-- installs `uv` in the current user account if it is unavailable;
-- installs Python 3.12 through `uv`;
-- creates the virtual environment at `.slide_pipeline/venv` through `uv sync`;
-- checks out SeedVR2 at the pinned commit `4490bd1f482e026674543386bb2a4d176da245b9`;
-- downloads the 3B FP16 SeedVR2 model and FP16 VAE;
-- verifies both model files using pinned SHA-256 hashes; and
-- runs the installation doctor.
+- verifies Bazzite, x86-64, `nvidia-smi`, and required host commands;
+- reports the detected GPU, VRAM, and driver;
+- installs Python 3.12 and the locked CUDA-capable environment through `uv`;
+- checks out SeedVR2 at commit `4490bd1f482e026674543386bb2a4d176da245b9`;
+- downloads the 3B FP16 model, 3B FP8 model, and FP16 VAE;
+- verifies all three pinned SHA-256 hashes; and
+- runs the complete CUDA doctor for both profiles.
 
-Re-running `./setup_pipeline.sh` is safe. Existing valid downloads and dependencies are reused, while hashes and the complete installation are checked again.
+Re-running `./setup_bazzite.sh` reuses valid downloads and checks the complete installation again.
 
-## Verify the installation
+Verify it independently with:
 
 ```bash
-./run_pipeline.sh doctor
+./run_pipeline.sh doctor --all-profiles
 ```
 
-A healthy Apple Silicon installation reports JSON similar to:
+The report must identify `Bazzite`, backend `cuda`, the expected NVIDIA GPU, approximately 12 GB VRAM, 64 GB system RAM, both profiles, the pinned SeedVR2 commit, and the installed NVIDIA driver. If any value is wrong, stop before benchmarking.
 
-```json
-{
-  "status": "ok",
-  "python": "3.12.9",
-  "torch": "2.13.0",
-  "mps_available": true,
-  "seedvr2_commit": "4490bd1f482e026674543386bb2a4d176da245b9",
-  "models": [
-    "seedvr2_ema_3b_fp16.safetensors",
-    "ema_vae_fp16.safetensors"
-  ]
-}
-```
+## Run the Bazzite FP16-versus-FP8 benchmark
 
-## Prepare copied inputs
-
-Create a directory that is separate from your originals, then copy images into it. For example:
+First make a copied input. This example uses the scanner image included in the working project, but the path on the Bazzite PC may differ:
 
 ```bash
-mkdir -p "$HOME/slide-restoration-job/input"
-cp -p /path/to/originals/*.JPG "$HOME/slide-restoration-job/input/"
+mkdir -p "$HOME/slide-restoration-benchmark/input"
+cp -p /path/to/PICT0243.JPG "$HOME/slide-restoration-benchmark/input/"
 ```
 
-Confirm that the copied directory contains the expected files before continuing. Do not move or delete the originals.
+Then run both profiles with identical image, seed, and resolution rules:
 
-Supported image extensions are JPEG, PNG, TIFF, and WebP. Video files are not processed.
+```bash
+./run_pipeline.sh benchmark \
+  --input-image "$HOME/slide-restoration-benchmark/input/PICT0243.JPG" \
+  --output-dir "$HOME/slide-restoration-benchmark/output" \
+  --work-dir "$HOME/slide-restoration-benchmark/work"
+```
 
-## Run the pipeline
+For the included 3312×2208 scan, the default resolution quantum requests a 3456×2304 result from both profiles. The benchmark writes:
+
+```text
+output/
+├── archival-fp16/
+│   ├── delivery/
+│   ├── masters/
+│   └── manifest.json
+├── balanced-fp8/
+│   ├── delivery/
+│   ├── masters/
+│   └── manifest.json
+└── benchmark.json
+```
+
+`benchmark.json` records end-to-end time, model name, BlockSwap value, dimensions, hashes, mean absolute channel difference, PSNR, and SSIM. PSNR and SSIM compare the two generated outputs to each other; they do not establish that one is more faithful to the physical slide.
+
+If either SeedVR2 run fails, the benchmark still attempts the other profile and writes a `partial` report containing the failed command and return code. It then exits unsuccessfully so a missing comparison cannot be mistaken for a completed benchmark.
+
+Review both PNG masters at full resolution. Do not choose a production profile from runtime alone.
+
+## Run a production batch
+
+Create a copied-input directory, then select the reviewed profile explicitly on Bazzite:
 
 ```bash
 ./run_pipeline.sh \
-  --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output" \
-  --work-dir "$HOME/slide-restoration-job/work"
-```
-
-For copied images in nested subdirectories, add `--recursive`:
-
-```bash
-./run_pipeline.sh \
+  --profile archival-fp16 \
   --input-dir "$HOME/slide-restoration-job/input" \
   --output-dir "$HOME/slide-restoration-job/output" \
   --work-dir "$HOME/slide-restoration-job/work" \
   --recursive
 ```
 
-The output structure is:
+For the FP8 profile, replace `archival-fp16` with `balanced-fp8`.
+
+The FP8 CUDA starting point uses 16 swapped blocks. If the Bazzite test produces a CUDA out-of-memory error, do not reduce archival resolution or change models silently. Retry deliberately with 24 and then 32 blocks:
+
+```bash
+./run_pipeline.sh \
+  --profile balanced-fp8 \
+  --cuda-blocks-to-swap 24 \
+  --input-dir "$HOME/slide-restoration-job/input" \
+  --output-dir "$HOME/slide-restoration-job/output-fp8-24" \
+  --work-dir "$HOME/slide-restoration-job/work-fp8-24"
+```
+
+The FP16 profile already starts at the maximum 32 blocks. If it still fails, preserve the error and hardware report for diagnosis rather than falling back to FP8 automatically.
+
+## Install and run on Apple Silicon
+
+The existing Mac workflow remains FP16 by default:
+
+```bash
+./setup_pipeline.sh
+./run_pipeline.sh doctor
+./run_pipeline.sh \
+  --input-dir "$HOME/slide-restoration-job/input" \
+  --output-dir "$HOME/slide-restoration-job/output" \
+  --work-dir "$HOME/slide-restoration-job/work"
+```
+
+Requirements are Apple Silicon, macOS, Git, internet access during installation, and approximately 10 GB for the FP16 installation plus working/output space. A 32 GB unified-memory Mac is recommended for full-resolution scans.
+
+## Common command options
+
+```text
+--input-dir PATH              Copied input directory (required for run)
+--output-dir PATH             Separate final-output directory (required)
+--work-dir PATH               Separate intermediate directory (required)
+--profile NAME                archival-fp16 or balanced-fp8
+--cuda-blocks-to-swap N       Explicit CUDA override, 0-32
+--recursive                   Include supported nested images
+--limit N                     Process the first N sorted images
+--seed N                      Deterministic SeedVR2 seed; default 42
+--resolution-quantum N        Native short-edge bucket; default 256
+```
+
+Supported inputs are JPEG, PNG, TIFF, and WebP. Video files are not processed.
+
+The resolution bucket is never lower than the native short edge. This avoids silently shrinking archival scans.
+
+## Output and reproducibility
 
 ```text
 output/
-├── delivery/       High-quality JPEG files, quality 95 with 4:4:4 chroma
+├── delivery/       JPEG quality 95 with 4:4:4 chroma
 ├── masters/        Lossless PNG archival masters
-└── manifest.json   Processing record, measurements, and hashes
+└── manifest.json   Processing settings, measurements, and hashes
 ```
 
-The work directory contains prepared color-corrected images and raw SeedVR2 output. It can consume substantial disk space and may be removed manually after the final output has been reviewed and backed up.
+The work directory contains prepared color-corrected images and raw SeedVR2 output. It can be large and may be removed manually only after the final results have been reviewed and backed up.
 
-## Command options
+Dependencies are declared in `pyproject.toml` and pinned transitively in `uv.lock`. SeedVR2 is pinned to a specific Git commit. Model downloads are verified against pinned hashes. The manifest records the backend, selected profile, model, CUDA BlockSwap value, input/output hashes, dimensions, timestamps, color measurements, and focus score.
 
-```text
---input-dir PATH           Directory containing copied input images (required)
---output-dir PATH          Separate directory for final output (required)
---work-dir PATH            Separate directory for intermediate files (required)
---recursive                Include supported images in subdirectories
---limit N                  Process only the first N sorted images
---seed N                   Deterministic SeedVR2 seed; default: 42
---resolution-quantum N     Round the native short edge upward; default: 256
-```
+## Quality limits
 
-The resolution bucket is never lower than the image's native short edge. For example, a 3312×2208 scan is processed at a 2304-pixel short edge and produces a 3456×2304 result. This avoids silently shrinking archival scans.
+The settings are conservative, but SeedVR2 is generative:
 
-## Performance
+- Dust and scratches may remain.
+- Severe emulsion damage may require manual inpainting.
+- Strongly faded film stocks may need collection-specific color tuning.
+- Plausible but invented facial or object detail is possible.
+- FP8 uses lower-precision model weights and can differ from FP16.
 
-A verified 3312×2208 scanner image took approximately 299 seconds (about five minutes) on an M2 Max with 32 GB unified memory and produced a 3456×2304 result. Runtime varies with resolution, orientation, available unified memory, thermal state, and other GPU activity.
-
-Processing hundreds of full-resolution images on Apple Silicon will take many hours. The pipeline is deterministic and intended for unattended batches, but the first small batch should always be reviewed before committing to a complete archive.
-
-## Quality expectations
-
-The settings are deliberately conservative. The goal is to improve clarity, pixel structure, color balance, and local contrast while minimizing invented facial or object detail.
-
-Automated restoration has limits:
-
-- Small dust and scratch marks may remain.
-- Severe emulsion damage can require manual inpainting.
-- Strongly faded film stocks may need per-collection color tuning.
-- A generative restoration model can occasionally invent plausible detail.
-
-Review every final image at full resolution before treating it as an archival master. Preserve the physical slides and untouched digital captures independently.
-
-## Reproducibility and third-party components
-
-- Python dependencies are declared in `pyproject.toml` and pinned transitively in `uv.lock`.
-- SeedVR2 integration is fetched from [`numz/ComfyUI-SeedVR2_VideoUpscaler`](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) at a fixed commit.
-- Model downloads are validated against SHA-256 values in `setup_pipeline.sh`.
-- The processing manifest records input hashes, output hashes, dimensions, timestamps, color-correction measurements, and focus scores.
-
-SeedVR2 and its model weights are downloaded at installation time and are not distributed by this repository. Their respective licenses and usage terms apply separately.
+Review every master at full resolution. Preserve the physical slides and untouched digital captures independently.
 
 ## Troubleshooting
 
 ### `Pipeline is not installed`
 
-Run:
+Run `./setup_bazzite.sh` on Bazzite or `./setup_pipeline.sh` on Apple Silicon.
 
-```bash
-./setup_pipeline.sh
-```
+### Bazzite doctor reports that CUDA is unavailable
 
-### `Doctor failed: PyTorch MPS is unavailable`
+Confirm that `nvidia-smi` succeeds and that the PC is using the current Bazzite NVIDIA image. Do not install a separate NVIDIA driver over the Bazzite-managed driver.
 
-Confirm that the machine is an Apple Silicon Mac and that the command is not running inside an environment that hides the Metal GPU. Then rerun the installer and doctor.
+### CUDA out of memory
 
-### Out-of-memory termination
-
-Close GPU-intensive applications and retry the same settings. Do not lower resolution without consciously accepting the archival-quality tradeoff.
+Keep the copied input, resolution, seed, and profile fixed. For FP8, increase BlockSwap from 16 to 24 and then 32. FP16 already uses 32. Do not lower resolution unless consciously accepting a different archival result.
 
 ### Pipeline refuses a path
 
-The path conflicts with a non-destructive safety rule. Create a new copied-input directory and separate output/work directories rather than bypassing the guard.
+The path conflicts with a non-destructive safety rule. Create a new copied-input directory and separate output/work directories instead of bypassing the guard.
 
 ## License
 
-The original code in this repository is available under the MIT License. Third-party repositories, Python packages, and model weights retain their own licenses.
+Original code in this repository is available under the MIT License. SeedVR2, model weights, and other third-party components retain their own licenses and usage terms.

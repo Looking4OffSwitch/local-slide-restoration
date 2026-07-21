@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Guarded, local slide-restoration pipeline for Apple Silicon."""
+"""Guarded, local slide-restoration pipeline for Apple Silicon and Bazzite."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,9 +27,36 @@ STATE = ROOT / ".slide_pipeline"
 VENDOR = STATE / "vendor" / "seedvr2"
 MODELS = STATE / "models"
 ORIGINAL_DIRS = ((ROOT / "manual").resolve(), (ROOT / "machine").resolve())
-DIT_MODEL = "seedvr2_ema_3b_fp16.safetensors"
+SEEDVR2_COMMIT = "4490bd1f482e026674543386bb2a4d176da245b9"
+FP16_DIT_MODEL = "seedvr2_ema_3b_fp16.safetensors"
+FP8_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 VAE_MODEL = "ema_vae_fp16.safetensors"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+
+
+@dataclass(frozen=True)
+class RestorationProfile:
+    name: str
+    model: str
+    description: str
+    cuda_blocks_to_swap: int
+
+
+PROFILES = {
+    "archival-fp16": RestorationProfile(
+        name="archival-fp16",
+        model=FP16_DIT_MODEL,
+        description="FP16 archival-quality model with maximum CUDA BlockSwap",
+        cuda_blocks_to_swap=32,
+    ),
+    "balanced-fp8": RestorationProfile(
+        name="balanced-fp8",
+        model=FP8_DIT_MODEL,
+        description="FP8 model recommended by SeedVR2 for 12-16 GB CUDA GPUs",
+        cuda_blocks_to_swap=16,
+    ),
+}
+DEFAULT_PROFILE = "archival-fp16"
 
 
 def is_within(path: Path, parent: Path) -> bool:
@@ -46,7 +76,8 @@ def guard_paths(input_dir: Path, output_dir: Path, work_dir: Path) -> None:
     for original in ORIGINAL_DIRS:
         if is_within(input_dir, original):
             raise SystemExit(
-                f"Refusing to process originals: {input_dir}. Copy images to a separate directory first."
+                f"Refusing to process originals: {input_dir}. "
+                "Copy images to a separate directory first."
             )
         if is_within(output_dir, original) or is_within(work_dir, original):
             raise SystemExit(f"Refusing to write inside originals directory: {original}")
@@ -156,41 +187,184 @@ def finish_image(restored: Path, master: Path, delivery: Path) -> dict[str, obje
     }
 
 
-def doctor() -> None:
+def read_os_release() -> dict[str, str]:
+    values: dict[str, str] = {}
+    os_release = Path("/etc/os-release")
+    if not os_release.is_file():
+        return values
+    for line in os_release.read_text(encoding="utf-8").splitlines():
+        if "=" not in line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value.strip().strip('"')
+    return values
+
+
+def detect_backend(torch_module: object) -> str | None:
+    if sys.platform == "darwin" and torch_module.backends.mps.is_available():
+        return "mps"
+    if sys.platform.startswith("linux") and torch_module.cuda.is_available():
+        return "cuda"
+    return None
+
+
+def doctor(profile_names: list[str]) -> dict[str, object]:
     import torch
+    import psutil
 
     problems: list[str] = []
-    if sys.platform != "darwin":
-        problems.append("host is not macOS")
-    if not torch.backends.mps.is_available():
-        problems.append("PyTorch MPS is unavailable")
+    backend = detect_backend(torch)
+    system = platform.system()
+    machine = platform.machine()
+    os_release = read_os_release()
+    system_ram_gib = psutil.virtual_memory().total / (1024**3)
+    cuda_devices: list[dict[str, object]] = []
+    if system == "Darwin":
+        if machine != "arm64":
+            problems.append("macOS host is not Apple Silicon")
+        if backend != "mps":
+            problems.append("PyTorch MPS is unavailable")
+    elif system == "Linux":
+        if machine != "x86_64":
+            problems.append(f"Bazzite host architecture is unsupported: {machine}")
+        if os_release.get("ID") != "bazzite":
+            problems.append(
+                f"Linux host is not Bazzite (reported ID={os_release.get('ID', 'unknown')})"
+            )
+        if backend != "cuda":
+            problems.append("PyTorch CUDA is unavailable")
+        if shutil.which("nvidia-smi") is None:
+            problems.append("nvidia-smi is unavailable")
+        if backend == "cuda":
+            for index in range(torch.cuda.device_count()):
+                properties = torch.cuda.get_device_properties(index)
+                cuda_devices.append(
+                    {
+                        "index": index,
+                        "name": properties.name,
+                        "vram_gib": round(properties.total_memory / (1024**3), 2),
+                        "compute_capability": f"{properties.major}.{properties.minor}",
+                    }
+                )
+            if not cuda_devices:
+                problems.append("CUDA reports no NVIDIA devices")
+            else:
+                selected_device = cuda_devices[0]
+                if "RTX 4080" not in str(selected_device["name"]):
+                    problems.append(
+                        f"CUDA device 0 is not the expected RTX 4080: {selected_device['name']}"
+                    )
+                selected_vram_gib = float(selected_device["vram_gib"])
+                if not 11.0 <= selected_vram_gib <= 13.0:
+                    problems.append(
+                        f"CUDA device 0 reports {selected_vram_gib} GiB, "
+                        "not the expected 12 GB VRAM"
+                    )
+            if system_ram_gib < 60.0:
+                problems.append("host reports less than the expected 64 GB system RAM")
+    else:
+        problems.append(f"unsupported operating system: {system}")
     if not (VENDOR / "inference_cli.py").is_file():
         problems.append("SeedVR2 checkout is missing")
-    for model in (DIT_MODEL, VAE_MODEL):
+    seedvr2_commit = None
+    if (VENDOR / ".git").is_dir():
+        commit_result = subprocess.run(
+            ["git", "-C", str(VENDOR), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if commit_result.returncode != 0:
+            problems.append("SeedVR2 checkout commit cannot be read")
+        else:
+            seedvr2_commit = commit_result.stdout.strip()
+        if seedvr2_commit is not None and seedvr2_commit != SEEDVR2_COMMIT:
+            problems.append(
+                f"SeedVR2 checkout is at {seedvr2_commit}, expected {SEEDVR2_COMMIT}"
+            )
+    else:
+        problems.append("SeedVR2 Git metadata is missing")
+    requested_models = [PROFILES[name].model for name in profile_names]
+    for model in (*requested_models, VAE_MODEL):
         if not (MODELS / model).is_file():
             problems.append(f"model is missing: {model}")
     if problems:
         raise SystemExit("Doctor failed: " + "; ".join(problems))
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "python": sys.version.split()[0],
-                "torch": torch.__version__,
-                "mps_available": True,
-                "seedvr2_commit": subprocess.check_output(
-                    ["git", "-C", str(VENDOR), "rev-parse", "HEAD"], text=True
-                ).strip(),
-                "models": [DIT_MODEL, VAE_MODEL],
-            },
-            indent=2,
+    report: dict[str, object] = {
+        "status": "ok",
+        "os": system,
+        "os_id": os_release.get("ID") if os_release else None,
+        "architecture": machine,
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "backend": backend,
+        "system_ram_gib": round(system_ram_gib, 2),
+        "seedvr2_commit": seedvr2_commit,
+        "profiles": profile_names,
+        "models": [*requested_models, VAE_MODEL],
+    }
+    if backend == "cuda":
+        report["cuda_runtime"] = torch.version.cuda
+        report["cuda_devices"] = cuda_devices
+        nvidia_smi = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-    )
+        report["nvidia_driver"] = nvidia_smi.stdout.splitlines()[0].strip()
+    else:
+        report["mps_available"] = True
+    print(json.dumps(report, indent=2))
+    return report
+
+
+def seedvr_arguments(
+    profile: RestorationProfile, backend: str, cuda_blocks_to_swap: int | None
+) -> list[str]:
+    arguments = [
+        "--dit_model",
+        profile.model,
+        "--vae_encode_tiled",
+        "--vae_decode_tiled",
+        "--cache_dit",
+        "--cache_vae",
+    ]
+    if backend == "cuda":
+        blocks_to_swap = (
+            profile.cuda_blocks_to_swap
+            if cuda_blocks_to_swap is None
+            else cuda_blocks_to_swap
+        )
+        arguments.extend(
+            [
+                "--cuda_device",
+                "0",
+                "--dit_offload_device",
+                "cpu",
+                "--vae_offload_device",
+                "cpu",
+                "--tensor_offload_device",
+                "cpu",
+                "--blocks_to_swap",
+                str(blocks_to_swap),
+            ]
+        )
+        if blocks_to_swap > 0:
+            arguments.append("--swap_io_components")
+    return arguments
 
 
 def collect_images(input_dir: Path, recursive: bool, limit: int | None) -> list[Path]:
     iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
-    images = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+    images = sorted(
+        path
+        for path in iterator
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
     if limit is not None:
         images = images[:limit]
     if not images:
@@ -198,14 +372,20 @@ def collect_images(input_dir: Path, recursive: bool, limit: int | None) -> list[
     return images
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> dict[str, object]:
     if args.resolution_quantum <= 0:
         raise SystemExit("--resolution-quantum must be a positive integer")
+    if args.cuda_blocks_to_swap is not None and not 0 <= args.cuda_blocks_to_swap <= 32:
+        raise SystemExit("--cuda-blocks-to-swap must be between 0 and 32")
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
     work_dir = args.work_dir.resolve()
     guard_paths(input_dir, output_dir, work_dir)
-    doctor()
+    profile = PROFILES[args.profile]
+    installation = doctor([profile.name])
+    backend = str(installation["backend"])
+    if backend != "cuda" and args.cuda_blocks_to_swap is not None:
+        raise SystemExit("--cuda-blocks-to-swap is only valid on the Bazzite CUDA host")
     images = collect_images(input_dir, args.recursive, args.limit)
 
     prepared_dir = work_dir / "prepared"
@@ -213,8 +393,17 @@ def run(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, object] = {
-        "pipeline": "slide-restoration-macos-v1",
+        "pipeline": "local-slide-restoration-v2",
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "backend": backend,
+        "profile": profile.name,
+        "profile_description": profile.description,
+        "dit_model": profile.model,
+        "cuda_blocks_to_swap": (
+            profile.cuda_blocks_to_swap
+            if backend == "cuda" and args.cuda_blocks_to_swap is None
+            else args.cuda_blocks_to_swap
+        ),
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "files": [],
@@ -227,7 +416,8 @@ def run(args: argparse.Namespace) -> None:
         for original in ORIGINAL_DIRS:
             if is_within(resolved_source, original):
                 raise SystemExit(
-                    f"Refusing an input that resolves into originals: {source} -> {resolved_source}"
+                    "Refusing an input that resolves into originals: "
+                    f"{source} -> {resolved_source}"
                 )
         relative = source.relative_to(input_dir)
         with Image.open(source) as opened:
@@ -260,8 +450,6 @@ def run(args: argparse.Namespace) -> None:
             str(bucket_output),
             "--output_format",
             "png",
-            "--dit_model",
-            DIT_MODEL,
             "--model_dir",
             str(MODELS),
             "--resolution",
@@ -272,10 +460,7 @@ def run(args: argparse.Namespace) -> None:
             str(args.seed),
             "--color_correction",
             "lab",
-            "--vae_encode_tiled",
-            "--vae_decode_tiled",
-            "--cache_dit",
-            "--cache_vae",
+            *seedvr_arguments(profile, backend, args.cuda_blocks_to_swap),
         ]
         subprocess.run(seed_command, cwd=VENDOR, check=True)
 
@@ -304,16 +489,183 @@ def run(args: argparse.Namespace) -> None:
         temporary_path = Path(temporary.name)
     temporary_path.replace(manifest_path)
     print(f"Completed {len(images)} images; manifest: {manifest_path}")
+    return manifest
+
+
+def compare_profile_outputs(
+    fp16_master: Path, fp8_master: Path
+) -> dict[str, float | None]:
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+    with Image.open(fp16_master) as opened:
+        fp16 = np.asarray(opened.convert("RGB"))
+    with Image.open(fp8_master) as opened:
+        fp8 = np.asarray(opened.convert("RGB"))
+    if fp16.shape != fp8.shape:
+        raise SystemExit(
+            f"Benchmark outputs have different dimensions: {fp16.shape} versus {fp8.shape}"
+        )
+    absolute_difference = np.abs(fp16.astype(np.int16) - fp8.astype(np.int16))
+    maximum_difference = float(absolute_difference.max())
+    psnr = (
+        None
+        if maximum_difference == 0.0
+        else float(peak_signal_noise_ratio(fp16, fp8, data_range=255))
+    )
+    return {
+        "mean_absolute_channel_difference": float(absolute_difference.mean()),
+        "maximum_channel_difference": maximum_difference,
+        "psnr_db": psnr,
+        "ssim": float(
+            structural_similarity(fp16, fp8, channel_axis=2, data_range=255)
+        ),
+    }
+
+
+def benchmark(args: argparse.Namespace) -> None:
+    if args.resolution_quantum <= 0:
+        raise SystemExit("--resolution-quantum must be a positive integer")
+    source = args.input_image.resolve()
+    if not source.is_file() or source.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise SystemExit(f"Benchmark input is not a supported image: {source}")
+    for original in ORIGINAL_DIRS:
+        if is_within(source, original):
+            raise SystemExit(
+                f"Refusing to benchmark an original: {source}. Copy it elsewhere first."
+            )
+    output_dir = args.output_dir.resolve()
+    work_dir = args.work_dir.resolve()
+    if (
+        output_dir == work_dir
+        or is_within(output_dir, work_dir)
+        or is_within(work_dir, output_dir)
+    ):
+        raise SystemExit("Benchmark output and work directories must be separate.")
+    if is_within(source, output_dir) or is_within(source, work_dir):
+        raise SystemExit("Benchmark input must be outside the output and work directories.")
+    installation = doctor(list(PROFILES))
+    if installation["backend"] != "cuda":
+        raise SystemExit("The FP16-versus-FP8 benchmark requires the Bazzite CUDA host.")
+
+    copied_input_dir = work_dir / "copied-input"
+    copied_input_dir.mkdir(parents=True, exist_ok=True)
+    copied_input = copied_input_dir / source.name
+    shutil.copy2(source, copied_input)
+    if sha256(source) != sha256(copied_input):
+        raise SystemExit("Benchmark input copy failed SHA-256 verification.")
+
+    results: dict[str, object] = {
+        "pipeline": "local-slide-restoration-profile-benchmark-v1",
+        "status": "running",
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source": str(source),
+        "source_sha256": sha256(source),
+        "seed": args.seed,
+        "resolution_quantum": args.resolution_quantum,
+        "execution_order": ["archival-fp16", "balanced-fp8"],
+        "environment": installation,
+        "profiles": {},
+    }
+    profile_results = results["profiles"]
+    assert isinstance(profile_results, dict)
+    masters: dict[str, Path] = {}
+    failures: list[str] = []
+    for profile_name in ("archival-fp16", "balanced-fp8"):
+        profile_output = output_dir / profile_name
+        profile_work = work_dir / profile_name
+        run_args = argparse.Namespace(
+            input_dir=copied_input_dir,
+            output_dir=profile_output,
+            work_dir=profile_work,
+            recursive=False,
+            limit=None,
+            seed=args.seed,
+            resolution_quantum=args.resolution_quantum,
+            profile=profile_name,
+            cuda_blocks_to_swap=None,
+        )
+        started = time.perf_counter()
+        try:
+            manifest = run(run_args)
+        except subprocess.CalledProcessError as error:
+            elapsed_seconds = time.perf_counter() - started
+            profile_results[profile_name] = {
+                "status": "failed",
+                "elapsed_seconds": elapsed_seconds,
+                "return_code": error.returncode,
+                "command": [str(part) for part in error.cmd],
+            }
+            failures.append(profile_name)
+            continue
+        elapsed_seconds = time.perf_counter() - started
+        records = manifest["files"]
+        assert isinstance(records, list) and len(records) == 1
+        record = records[0]
+        assert isinstance(record, dict)
+        master = Path(str(record["master"]))
+        masters[profile_name] = master
+        profile_results[profile_name] = {
+            "status": "ok",
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_minutes": elapsed_seconds / 60.0,
+            "model": manifest["dit_model"],
+            "cuda_blocks_to_swap": manifest["cuda_blocks_to_swap"],
+            "master": str(master),
+            "master_sha256": record["master_sha256"],
+            "output_width": record["output_width"],
+            "output_height": record["output_height"],
+        }
+
+    if not failures:
+        results["output_comparison"] = compare_profile_outputs(
+            masters["archival-fp16"], masters["balanced-fp8"]
+        )
+        results["status"] = "ok"
+    else:
+        results["output_comparison"] = None
+        results["status"] = "partial"
+        results["failed_profiles"] = failures
+    results["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "benchmark.json"
+    with tempfile.NamedTemporaryFile("w", dir=output_dir, delete=False) as temporary:
+        json.dump(results, temporary, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(report_path)
+    print(f"Benchmark complete; report: {report_path}")
+    if failures:
+        raise SystemExit(
+            "Benchmark was incomplete for profile(s): "
+            + ", ".join(failures)
+            + f". Inspect {report_path} and the preceding SeedVR2 error."
+        )
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     subparsers = root.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("doctor", help="verify the complete local installation")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="verify the complete local installation"
+    )
+    doctor_parser.add_argument(
+        "--profile", choices=PROFILES, default=DEFAULT_PROFILE
+    )
+    doctor_parser.add_argument(
+        "--all-profiles", action="store_true", help="verify both FP16 and FP8 models"
+    )
     run_parser = subparsers.add_parser("run", help="restore images from a copied input directory")
     run_parser.add_argument("--input-dir", type=Path, required=True)
     run_parser.add_argument("--output-dir", type=Path, required=True)
     run_parser.add_argument("--work-dir", type=Path, required=True)
+    run_parser.add_argument(
+        "--profile", choices=PROFILES, default=DEFAULT_PROFILE
+    )
+    run_parser.add_argument(
+        "--cuda-blocks-to-swap",
+        type=int,
+        help="override the selected profile's tested-starting-point BlockSwap value (0-32)",
+    )
     run_parser.add_argument("--recursive", action="store_true")
     run_parser.add_argument("--limit", type=int)
     run_parser.add_argument("--seed", type=int, default=42)
@@ -323,13 +675,28 @@ def parser() -> argparse.ArgumentParser:
         default=256,
         help="round each native short edge upward to this bucket size; never downsamples",
     )
+    benchmark_parser = subparsers.add_parser(
+        "benchmark", help="compare FP16 and FP8 on one copied image using CUDA"
+    )
+    benchmark_parser.add_argument("--input-image", type=Path, required=True)
+    benchmark_parser.add_argument("--output-dir", type=Path, required=True)
+    benchmark_parser.add_argument("--work-dir", type=Path, required=True)
+    benchmark_parser.add_argument("--seed", type=int, default=42)
+    benchmark_parser.add_argument(
+        "--resolution-quantum",
+        type=int,
+        default=256,
+        help="round the native short edge upward; must match production settings",
+    )
     return root
 
 
 def main() -> None:
     args = parser().parse_args()
     if args.command == "doctor":
-        doctor()
+        doctor(list(PROFILES) if args.all_profiles else [args.profile])
+    elif args.command == "benchmark":
+        benchmark(args)
     else:
         run(args)
 

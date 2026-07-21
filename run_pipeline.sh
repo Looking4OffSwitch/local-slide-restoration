@@ -9,9 +9,10 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 
-if [[ "${1:-}" == "doctor" ]]; then
+if [[ "${1:-}" == "doctor" || "${1:-}" == "benchmark" || "${1:-}" == "run" ]]; then
+  COMMAND="$1"
   shift
-  exec "$PYTHON" "$SCRIPT_DIR/slide_pipeline.py" doctor "$@"
+  exec "$PYTHON" "$SCRIPT_DIR/slide_pipeline.py" "$COMMAND" "$@"
 fi
 
 exec "$PYTHON" "$SCRIPT_DIR/slide_pipeline.py" run "$@"

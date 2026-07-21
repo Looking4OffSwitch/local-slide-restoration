@@ -1,7 +1,7 @@
 [project]
 name = "local-slide-restoration"
 version = "1.0.0"
-description = "A guarded local restoration pipeline for scanned photographic slides on Apple Silicon"
+description = "A guarded local restoration pipeline for scanned slides on Apple Silicon and Bazzite CUDA"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"
