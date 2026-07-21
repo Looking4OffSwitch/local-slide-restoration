@@ -18,9 +18,10 @@ The pipeline applies:
 7. Color-managed lossless PNG output in `originals/` and high-quality JPEG output in `restored/`.
 8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
 
-Images are handled one native-resolution bucket at a time. The pipeline color
-corrects and converts a bucket, immediately restores it with SeedVR2, and then moves
-to the next bucket. Successfully prepared images are checkpointed in the work
+Images are handled one internal resolution bucket at a time. The pipeline color
+corrects and converts a bucket, restores it with SeedVR2, and resizes the model result
+back to the EXIF-oriented input dimensions before sharpening and saving. Delivered
+images are never enlarged. Successfully prepared images are checkpointed in the work
 directory and reused after an interrupted run unless the source file changed.
 
 ## Safety: originals are never output targets
@@ -36,7 +37,7 @@ directory and reused after an interrupted run unless the source file changed.
 
 ## Restoration profiles
 
-Both profiles use the pinned 3B SeedVR2 architecture, the same FP16 VAE, the same seed, LAB color matching, tiled VAE encoding/decoding, and native-resolution bucketing.
+Both profiles use the pinned 3B SeedVR2 architecture, the same FP16 VAE, the same seed, LAB color matching, tiled VAE encoding/decoding, and internal resolution bucketing.
 
 | Profile | DiT model | CUDA starting configuration | Purpose |
 |---|---|---|---|
@@ -108,7 +109,8 @@ Then run both profiles with identical image, seed, and resolution rules:
   --work-dir "$HOME/slide-restoration-benchmark/work"
 ```
 
-For the included 3312×2208 scan, the default resolution quantum requests a 3456×2304 result from both profiles. The benchmark writes:
+For the included 3312×2208 scan, SeedVR2 works internally at 3456×2304, but both
+saved results remain 3312×2208. The benchmark writes:
 
 ```text
 output/
@@ -213,7 +215,9 @@ Requirements are Apple Silicon, macOS, Git, internet access during installation,
 
 Supported inputs are JPEG, PNG, TIFF, and WebP. Video files are not processed.
 
-The resolution bucket is never lower than the native short edge. This avoids silently shrinking archival scans.
+The internal SeedVR2 bucket is never lower than the native short edge. After model
+processing, the result is returned to the original oriented dimensions; internal model
+bucketing never enlarges the saved image.
 
 ## Output and reproducibility
 

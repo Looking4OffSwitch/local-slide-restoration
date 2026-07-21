@@ -269,11 +269,17 @@ class ColorManagementTests(unittest.TestCase):
             Image.new("RGB", (32, 32), (120, 80, 40)).save(source)
 
             record = slide_pipeline.prepare_image(source, prepared)
-            finished = slide_pipeline.finish_image(prepared, original, restored)
+            finished = slide_pipeline.finish_image(
+                prepared, original, restored, output_size=(24, 20)
+            )
 
             self.assertEqual(record["input_icc_source"], "assumed-srgb")
             self.assertIn("prepared_sha256", record)
             self.assertIn("restored_sha256", finished)
+            self.assertEqual(finished["output_width"], 24)
+            self.assertEqual(finished["output_height"], 20)
+            self.assertEqual(finished["model_output_width"], 32)
+            self.assertEqual(finished["model_output_height"], 32)
             for path in (prepared, original, restored):
                 with Image.open(path) as opened:
                     profile = opened.info.get("icc_profile")

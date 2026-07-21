@@ -244,9 +244,18 @@ def prepare_image(source: Path, destination: Path) -> dict[str, object]:
     }
 
 
-def finish_image(seedvr_output: Path, original: Path, restored: Path) -> dict[str, object]:
+def finish_image(
+    seedvr_output: Path,
+    original: Path,
+    restored: Path,
+    output_size: tuple[int, int],
+) -> dict[str, object]:
     with Image.open(seedvr_output) as opened:
-        rgb = np.asarray(opened.convert("RGB"))
+        converted = opened.convert("RGB")
+        model_output_size = converted.size
+        if converted.size != output_size:
+            converted = converted.resize(output_size, Image.Resampling.LANCZOS)
+        rgb = np.asarray(converted)
     sharpened, focus_score = conservative_sharpen(rgb)
     result = Image.fromarray(sharpened, "RGB")
     atomic_save(
@@ -270,6 +279,8 @@ def finish_image(seedvr_output: Path, original: Path, restored: Path) -> dict[st
         "restored": str(restored),
         "output_width": int(rgb.shape[1]),
         "output_height": int(rgb.shape[0]),
+        "model_output_width": model_output_size[0],
+        "model_output_height": model_output_size[1],
         "focus_score": focus_score,
         "original_sha256": sha256(original),
         "restored_sha256": sha256(restored),
@@ -764,7 +775,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if not restored.is_file():
             raise SystemExit(f"SeedVR2 did not produce expected output: {restored}")
         original, restored_output = output_paths(output_dir, relative)
-        record.update(finish_image(restored, original, restored_output))
+        output_size = (
+            int(str(record["input_width"])),
+            int(str(record["input_height"])),
+        )
+        record.update(finish_image(restored, original, restored_output, output_size))
 
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     manifest_path = output_dir / "manifest.json"
@@ -1048,7 +1063,7 @@ def parser() -> argparse.ArgumentParser:
         "--resolution-quantum",
         type=int,
         default=256,
-        help="round each native short edge upward to this bucket size; never downsamples",
+        help="internal model bucket quantum; saved dimensions remain unchanged",
     )
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="compare FP16 and FP8 on one copied image using CUDA"
