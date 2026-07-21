@@ -18,13 +18,18 @@ The pipeline applies:
 7. Lossless PNG master and high-quality JPEG delivery output.
 8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
 
+Images are handled one native-resolution bucket at a time. The pipeline color
+corrects and converts a bucket, immediately restores it with SeedVR2, and then moves
+to the next bucket. Successfully prepared images are checkpointed in the work
+directory and reused after an interrupted run unless the source file changed.
+
 ## Safety: originals are never output targets
 
-- Work only with copied photographs. Keep the originals and an independent backup.
+- The pipeline reads source photographs without modifying or deleting them. Keep an
+  independent backup of irreplaceable originals.
 - Never point the output or working directories at the source-photo directory.
-- The pipeline refuses the repository-local `originals/` archive and the legacy
-  `manual/` and `machine/` source directories.
-- It refuses symlinked inputs that resolve into either protected directory.
+- The repository-local `originals/` archive and legacy `manual/` and `machine/`
+  directories are valid inputs, but cannot contain output or working directories.
 - It refuses an output or work directory nested beneath the input directory.
 - Model files, environments, working files, and image outputs are excluded by `.gitignore`.
 
@@ -167,7 +172,7 @@ Requirements are Apple Silicon, macOS, Git, internet access during installation,
 ## Common command options
 
 ```text
---input-dir PATH              Copied input directory (required for run)
+--input-dir PATH              Source image directory (required for run; read-only)
 --output-dir PATH             Separate final-output directory (required)
 --work-dir PATH               Intermediate directory; defaults to .OUTPUT-work beside output
 --profile NAME                archival-fp16 or balanced-fp8

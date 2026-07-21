@@ -77,11 +77,6 @@ def guard_paths(input_dir: Path, output_dir: Path, work_dir: Path) -> None:
     if not input_dir.is_dir():
         raise SystemExit(f"Input directory does not exist: {input_dir}")
     for original in ORIGINAL_DIRS:
-        if is_within(input_dir, original):
-            raise SystemExit(
-                f"Refusing to process originals: {input_dir}. "
-                "Copy images to a separate directory first."
-            )
         if is_within(output_dir, original) or is_within(work_dir, original):
             raise SystemExit(f"Refusing to write inside originals directory: {original}")
     if input_dir == output_dir or is_within(output_dir, input_dir):
@@ -380,6 +375,53 @@ def default_work_dir(output_dir: Path) -> Path:
     return output_dir.parent / f".{output_dir.name}-work"
 
 
+def load_preparation_cache(cache_path: Path) -> dict[str, dict[str, object]]:
+    if not cache_path.is_file():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return {}
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return {key: value for key, value in entries.items() if isinstance(value, dict)}
+
+
+def save_preparation_cache(
+    cache_path: Path, entries: dict[str, dict[str, object]]
+) -> None:
+    """Atomically checkpoint preparation after each image."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=cache_path.parent, delete=False, encoding="utf-8"
+    ) as temporary:
+        json.dump({"version": 1, "entries": entries}, temporary, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(cache_path)
+
+
+def cached_preparation(
+    source: Path,
+    prepared: Path,
+    cache: dict[str, dict[str, object]],
+) -> dict[str, object] | None:
+    entry = cache.get(str(source.resolve()))
+    if entry is None or not prepared.is_file():
+        return None
+    stat = source.stat()
+    if (
+        entry.get("source_size") != stat.st_size
+        or entry.get("source_mtime_ns") != stat.st_mtime_ns
+        or entry.get("prepared") != str(prepared)
+    ):
+        return None
+    return dict(entry)
+
+
 def run_seedvr_with_progress(
     command: list[str], bucket_size: int, completed_before: int, progress: object
 ) -> None:
@@ -457,14 +499,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     buckets: dict[int, list[dict[str, object]]] = {}
     from tqdm.auto import tqdm
 
-    for source in tqdm(images, desc="Preparing", unit="photo", dynamic_ncols=True):
-        resolved_source = source.resolve()
-        for original in ORIGINAL_DIRS:
-            if is_within(resolved_source, original):
-                raise SystemExit(
-                    "Refusing an input that resolves into originals: "
-                    f"{source} -> {resolved_source}"
-                )
+    for source in tqdm(
+        images, desc="Scanning image dimensions", unit="photo", dynamic_ncols=True
+    ):
         relative = source.relative_to(input_dir)
         with Image.open(source) as opened:
             oriented_size = ImageOps.exif_transpose(opened).size
@@ -476,15 +513,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         unique_name = hashlib.sha256(str(relative).encode("utf-8")).hexdigest()[:10]
         prepared_name = f"{unique_name}__{source.stem}.png"
         prepared = prepared_dir / str(model_resolution) / prepared_name
-        record = prepare_image(source, prepared)
-        record["relative"] = str(relative)
-        record["prepared_name"] = prepared_name
-        record["native_short_edge"] = native_short_edge
-        record["model_resolution"] = model_resolution
-        manifest["files"].append(record)
-        buckets.setdefault(model_resolution, []).append(record)
+        buckets.setdefault(model_resolution, []).append(
+            {
+                "source_path": source,
+                "relative": str(relative),
+                "prepared_name": prepared_name,
+                "prepared_path": prepared,
+                "native_short_edge": native_short_edge,
+                "model_resolution": model_resolution,
+            }
+        )
 
-    print(f"Running SeedVR2 restoration in {len(buckets)} native-resolution bucket(s)")
+    cache_path = work_dir / "preparation-cache.json"
+    preparation_cache = load_preparation_cache(cache_path)
+    print(
+        f"Processing {len(images)} images in {len(buckets)} "
+        "native-resolution bucket(s)"
+    )
     restored_count = 0
     with tqdm(
         total=len(images),
@@ -493,35 +538,78 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         dynamic_ncols=True,
     ) as restoration_progress:
         for model_resolution in sorted(buckets):
-            bucket_input = prepared_dir / str(model_resolution)
+            bucket = buckets[model_resolution]
+            records: list[dict[str, object]] = []
+            cached_count = 0
+            with tqdm(
+                bucket,
+                desc=f"Color correcting and converting ({model_resolution}px)",
+                unit="photo",
+                dynamic_ncols=True,
+            ) as preparation_progress:
+                for item in preparation_progress:
+                    source = item["source_path"]
+                    prepared = item["prepared_path"]
+                    assert isinstance(source, Path)
+                    assert isinstance(prepared, Path)
+                    record = cached_preparation(
+                        source, prepared, preparation_cache
+                    )
+                    if record is not None:
+                        cached_count += 1
+                    else:
+                        record = prepare_image(source, prepared)
+                        source_stat = source.stat()
+                        record["source_size"] = source_stat.st_size
+                        record["source_mtime_ns"] = source_stat.st_mtime_ns
+                        preparation_cache[str(source.resolve())] = dict(record)
+                        save_preparation_cache(cache_path, preparation_cache)
+                    preparation_progress.set_postfix_str(
+                        f"{cached_count} cached", refresh=False
+                    )
+                    record["relative"] = item["relative"]
+                    record["prepared_name"] = item["prepared_name"]
+                    record["native_short_edge"] = item["native_short_edge"]
+                    record["model_resolution"] = model_resolution
+                    records.append(record)
+                    manifest["files"].append(record)
+
             bucket_output = seedvr_dir / str(model_resolution)
-            seed_command = [
-                sys.executable,
-                str(VENDOR / "inference_cli.py"),
-                str(bucket_input),
-                "--output",
-                str(bucket_output),
-                "--output_format",
-                "png",
-                "--model_dir",
-                str(MODELS),
-                "--resolution",
-                str(model_resolution),
-                "--batch_size",
-                "1",
-                "--seed",
-                str(args.seed),
-                "--color_correction",
-                "lab",
-                *seedvr_arguments(profile, backend, args.cuda_blocks_to_swap),
-            ]
-            bucket_size = len(buckets[model_resolution])
-            run_seedvr_with_progress(
-                seed_command,
-                bucket_size,
-                restored_count,
-                restoration_progress,
-            )
+            bucket_output.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=f"seedvr-input-{model_resolution}-", dir=work_dir
+            ) as temporary_bucket:
+                bucket_input = Path(temporary_bucket)
+                for record in records:
+                    prepared = Path(str(record["prepared"]))
+                    os.link(prepared, bucket_input / str(record["prepared_name"]))
+                seed_command = [
+                    sys.executable,
+                    str(VENDOR / "inference_cli.py"),
+                    str(bucket_input),
+                    "--output",
+                    str(bucket_output),
+                    "--output_format",
+                    "png",
+                    "--model_dir",
+                    str(MODELS),
+                    "--resolution",
+                    str(model_resolution),
+                    "--batch_size",
+                    "1",
+                    "--seed",
+                    str(args.seed),
+                    "--color_correction",
+                    "lab",
+                    *seedvr_arguments(profile, backend, args.cuda_blocks_to_swap),
+                ]
+                bucket_size = len(bucket)
+                run_seedvr_with_progress(
+                    seed_command,
+                    bucket_size,
+                    restored_count,
+                    restoration_progress,
+                )
             restored_count += bucket_size
 
     records = manifest["files"]

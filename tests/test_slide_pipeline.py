@@ -41,29 +41,40 @@ class ProfileTests(unittest.TestCase):
 
 
 class OriginalSafetyTests(unittest.TestCase):
-    def test_repository_originals_directory_is_protected(self) -> None:
+    def test_repository_originals_directory_can_be_read(self) -> None:
         originals = (slide_pipeline.ROOT / "originals").resolve()
         self.assertIn(originals, slide_pipeline.ORIGINAL_DIRS)
 
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
-            with self.assertRaisesRegex(SystemExit, "Refusing to process originals"):
-                slide_pipeline.guard_paths(
-                    originals,
-                    scratch / "output",
-                    scratch / "work",
-                )
+            slide_pipeline.guard_paths(
+                originals,
+                scratch / "output",
+                scratch / "work",
+            )
 
-    def test_symlink_to_repository_originals_is_protected(self) -> None:
+    def test_symlink_to_repository_originals_can_be_read(self) -> None:
         originals = (slide_pipeline.ROOT / "originals").resolve()
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
             linked_input = scratch / "input"
             linked_input.symlink_to(originals, target_is_directory=True)
-            with self.assertRaisesRegex(SystemExit, "Refusing to process originals"):
+            slide_pipeline.guard_paths(
+                linked_input,
+                scratch / "output",
+                scratch / "work",
+            )
+
+    def test_repository_originals_directory_cannot_be_written_to(self) -> None:
+        originals = (slide_pipeline.ROOT / "originals").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            input_dir = scratch / "input"
+            input_dir.mkdir()
+            with self.assertRaisesRegex(SystemExit, "Refusing to write"):
                 slide_pipeline.guard_paths(
-                    linked_input,
-                    scratch / "output",
+                    input_dir,
+                    originals / "output",
                     scratch / "work",
                 )
 
@@ -95,6 +106,51 @@ class CommandLineDefaultsTests(unittest.TestCase):
         self.assertEqual(
             slide_pipeline.default_work_dir(output), Path("/jobs/.restored-work")
         )
+
+
+class PreparationCacheTests(unittest.TestCase):
+    def test_completed_preparation_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jpg"
+            prepared = root / "prepared.png"
+            source.write_bytes(b"source")
+            prepared.write_bytes(b"prepared")
+            stat = source.stat()
+            entry = {
+                "prepared": str(prepared),
+                "source_size": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+            }
+            cached = slide_pipeline.cached_preparation(
+                source, prepared, {str(source.resolve()): entry}
+            )
+        self.assertEqual(cached, entry)
+
+    def test_changed_source_invalidates_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jpg"
+            prepared = root / "prepared.png"
+            source.write_bytes(b"changed source")
+            prepared.write_bytes(b"prepared")
+            entry = {
+                "prepared": str(prepared),
+                "source_size": 1,
+                "source_mtime_ns": source.stat().st_mtime_ns,
+            }
+            cached = slide_pipeline.cached_preparation(
+                source, prepared, {str(source.resolve()): entry}
+            )
+        self.assertIsNone(cached)
+
+    def test_cache_checkpoint_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "preparation-cache.json"
+            entries = {"/source.jpg": {"prepared": "/prepared.png"}}
+            slide_pipeline.save_preparation_cache(cache_path, entries)
+            loaded = slide_pipeline.load_preparation_cache(cache_path)
+        self.assertEqual(loaded, entries)
 
 
 class BenchmarkComparisonTests(unittest.TestCase):
