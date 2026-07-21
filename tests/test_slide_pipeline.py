@@ -146,9 +146,16 @@ class CommandLineDefaultsTests(unittest.TestCase):
 class SimpleModeTests(unittest.TestCase):
     def test_destination_uses_source_name_and_extension(self) -> None:
         self.assertEqual(
-            slide_pipeline.simple_destination(Path("/photos/scan.JPEG")),
-            Path("/photos/scan_restored.JPEG"),
+            slide_pipeline.simple_destination(
+                Path("/photos/scan.JPEG"), Path("/current/directory")
+            ),
+            Path("/current/directory/scan_restored.JPEG"),
         )
+
+    def test_destination_can_never_be_inside_repository_originals(self) -> None:
+        protected = slide_pipeline.ROOT / "originals"
+        with self.assertRaisesRegex(SystemExit, "protected originals"):
+            slide_pipeline.simple_destination(Path("/anywhere/scan.jpg"), protected / "machine")
 
     def test_missing_destination_needs_no_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

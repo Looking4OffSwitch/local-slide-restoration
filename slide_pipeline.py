@@ -792,8 +792,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     return manifest
 
 
-def simple_destination(source: Path) -> Path:
-    return source.with_name(f"{source.stem}_restored{source.suffix}")
+def simple_destination(source: Path, current_dir: Path | None = None) -> Path:
+    output_dir = Path.cwd() if current_dir is None else current_dir
+    destination = (output_dir / f"{source.stem}_restored{source.suffix}").resolve()
+    for original_dir in ORIGINAL_DIRS:
+        if is_within(destination, original_dir):
+            raise SystemExit(
+                f"Refusing to write inside protected originals directory: {original_dir}"
+            )
+    return destination
 
 
 def confirm_simple_overwrite(destination: Path) -> bool:
@@ -1032,7 +1039,7 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--simple",
         action="store_true",
-        help="restore one image beside the source as NAME_restored.EXT",
+        help="restore one image in the current directory as NAME_restored.EXT",
     )
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
