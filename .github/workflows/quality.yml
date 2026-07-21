@@ -1,0 +1,26 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          version: "0.11.30"
+      - run: uv sync --locked --only-group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check --python .venv slide_pipeline.py
+      - run: uv run pytest --cov --cov-report=term-missing
+      - run: uv export --frozen --no-emit-project | uv run pip-audit -r /dev/stdin --disable-pip
+      - run: bash -n run.sh setup_pipeline.sh setup_bazzite.sh
+      - run: shellcheck run.sh setup_pipeline.sh setup_bazzite.sh

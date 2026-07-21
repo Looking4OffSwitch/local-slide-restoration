@@ -9,6 +9,7 @@ MODEL_DIR="$PIPELINE_DIR/models"
 DOWNLOAD_DIR="$PIPELINE_DIR/downloads"
 SEEDVR2_REPO="https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
 SEEDVR2_COMMIT="4490bd1f482e026674543386bb2a4d176da245b9"
+UV_REQUIRED_VERSION="0.11.30"
 DIT_MODEL="seedvr2_ema_3b_fp16.safetensors"
 VAE_MODEL="ema_vae_fp16.safetensors"
 DIT_SHA256="2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
@@ -37,11 +38,13 @@ else
   log "Installing uv into the current user account"
   UV_INSTALLER="$DOWNLOAD_DIR/uv-install.sh"
   curl --fail --location --retry 3 --output "$UV_INSTALLER" \
-    "https://astral.sh/uv/install.sh"
+    "https://astral.sh/uv/$UV_REQUIRED_VERSION/install.sh"
   sh "$UV_INSTALLER"
   UV_BIN="$HOME/.local/bin/uv"
 fi
 [[ -x "$UV_BIN" ]] || fail "uv is unavailable after installation."
+[[ "$($UV_BIN --version)" == "uv $UV_REQUIRED_VERSION "* ]] || \
+  fail "uv $UV_REQUIRED_VERSION is required; found $($UV_BIN --version)."
 
 if [[ -d "$VENDOR_DIR/.git" ]]; then
   if ! git -C "$VENDOR_DIR" diff --quiet || ! git -C "$VENDOR_DIR" diff --cached --quiet; then

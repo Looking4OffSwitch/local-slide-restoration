@@ -15,7 +15,7 @@ The pipeline applies:
 4. SeedVR2 restoration on MPS or CUDA.
 5. LAB perceptual color matching to preserve the source image's identity.
 6. Adaptive, edge-masked sharpening.
-7. Lossless PNG master and high-quality JPEG delivery output.
+7. Color-managed, lossless PNG processed master and high-quality JPEG delivery output.
 8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
 
 Images are handled one native-resolution bucket at a time. The pipeline color
@@ -32,6 +32,7 @@ directory and reused after an interrupted run unless the source file changed.
   directories are valid inputs, but cannot contain output or working directories.
 - It refuses an output or work directory nested beneath the input directory.
 - Model files, environments, working files, and image outputs are excluded by `.gitignore`.
+- Existing planned output files are refused unless `--overwrite` is explicitly supplied.
 
 ## Restoration profiles
 
@@ -142,6 +143,20 @@ are the defaults, and the work directory defaults to a hidden sibling named
 
 For the FP8 profile, replace `archival-fp16` with `balanced-fp8`.
 
+## Restore one image
+
+Pass a supported JPEG, PNG, TIFF, or WebP directly without creating a temporary
+one-file input directory:
+
+```bash
+./run.sh \
+  --input-image "$HOME/slide-restoration-job/input/PICT0190.JPG" \
+  --output-dir "$HOME/slide-restoration-job/single-output"
+```
+
+The same profile, seed, resolution, work-directory, and overwrite options used for
+batch restoration apply to single-image runs.
+
 The FP8 CUDA starting point uses 16 swapped blocks. If the Bazzite test produces a CUDA out-of-memory error, do not reduce archival resolution or change models silently. Retry deliberately with 24 and then 32 blocks:
 
 ```bash
@@ -172,13 +187,15 @@ Requirements are Apple Silicon, macOS, Git, internet access during installation,
 ## Common command options
 
 ```text
---input-dir PATH              Source image directory (required for run; read-only)
+--input-dir PATH              Source image directory (mutually exclusive with --input-image)
+--input-image PATH            One source image (mutually exclusive with --input-dir)
 --output-dir PATH             Separate final-output directory (required)
 --work-dir PATH               Intermediate directory; defaults to .OUTPUT-work beside output
 --profile NAME                archival-fp16 or balanced-fp8
 --cuda-blocks-to-swap N       Explicit CUDA override, 0-32
 --recursive / --no-recursive  Include nested images; enabled by default
 --limit N                     Process the first N sorted images
+--overwrite                   Replace planned outputs that already exist
 --seed N                      Deterministic SeedVR2 seed; default 42
 --resolution-quantum N        Native short-edge bucket; default 256
 ```
@@ -192,11 +209,15 @@ The resolution bucket is never lower than the native short edge. This avoids sil
 ```text
 output/
 ├── delivery/       JPEG quality 95 with 4:4:4 chroma
-├── masters/        Lossless PNG archival masters
+├── masters/        Lossless, 8-bit, sRGB-profiled PNG processed masters
 └── manifest.json   Processing settings, measurements, and hashes
 ```
 
-The work directory contains prepared color-corrected images and raw SeedVR2 output. It can be large and may be removed manually only after the final results have been reviewed and backed up.
+Input ICC profiles are transformed to sRGB with LittleCMS. Untagged input is explicitly
+recorded as assumed sRGB. The work directory contains prepared color-corrected images and
+raw SeedVR2 output. It can be large and may be removed manually only after the final
+results have been reviewed and backed up. Untouched scans, rather than processed PNGs,
+remain the archival originals.
 
 Dependencies are declared in `pyproject.toml` and pinned transitively in `uv.lock`. SeedVR2 is pinned to a specific Git commit. Model downloads are verified against pinned hashes. The manifest records the backend, selected profile, model, CUDA BlockSwap value, input/output hashes, dimensions, timestamps, color measurements, and focus score.
 

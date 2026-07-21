@@ -1,6 +1,8 @@
 .DS_Store
+.coverage
 .slide_pipeline/
 .venv/
+.verification/
 __pycache__/
 *.py[cod]
 

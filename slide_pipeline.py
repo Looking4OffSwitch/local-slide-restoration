@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import re
 import shutil
@@ -17,11 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any, Protocol, cast
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
-
+from PIL import Image, ImageCms, ImageOps
 
 ROOT = Path(os.environ.get("SLIDE_PIPELINE_ROOT", Path(__file__).parent)).resolve()
 STATE = ROOT / ".slide_pipeline"
@@ -35,6 +37,16 @@ FP16_DIT_MODEL = "seedvr2_ema_3b_fp16.safetensors"
 FP8_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 VAE_MODEL = "ema_vae_fp16.safetensors"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+PREPARATION_VERSION = "color-tone-v2-icc-srgb"
+MANIFEST_SCHEMA_VERSION = 3
+SRGB_PROFILE = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+SRGB_PROFILE_BYTES = SRGB_PROFILE.tobytes()
+
+
+class Progress(Protocol):
+    n: int | float
+
+    def update(self, value: int | float) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,8 @@ def guard_paths(input_dir: Path, output_dir: Path, work_dir: Path) -> None:
         raise SystemExit("Output must be outside the input directory.")
     if input_dir == work_dir or is_within(work_dir, input_dir):
         raise SystemExit("Work directory must be outside the input directory.")
+    if output_dir == work_dir or is_within(output_dir, work_dir) or is_within(work_dir, output_dir):
+        raise SystemExit("Output and work directories must be separate.")
 
 
 def sha256(path: Path) -> str:
@@ -148,19 +162,70 @@ def conservative_sharpen(rgb: np.ndarray) -> tuple[np.ndarray, float]:
     return result, focus_score
 
 
+def color_managed_rgb(opened: Image.Image) -> tuple[Image.Image, dict[str, object]]:
+    """Convert tagged input to sRGB and document the assumption for untagged input."""
+    embedded = opened.info.get("icc_profile")
+    if embedded:
+        try:
+            source_profile = ImageCms.ImageCmsProfile(io.BytesIO(embedded))
+            converted = ImageCms.profileToProfile(
+                opened, source_profile, SRGB_PROFILE, outputMode="RGB"
+            )
+        except (OSError, ImageCms.PyCMSError) as error:
+            raise ValueError(f"invalid embedded ICC profile: {error}") from error
+        profile_source = "embedded"
+        profile_sha256 = hashlib.sha256(embedded).hexdigest()
+    else:
+        converted = opened.convert("RGB")
+        profile_source = "assumed-srgb"
+        profile_sha256 = None
+    if converted is None:
+        raise ValueError("ICC conversion did not produce an image")
+    return converted, {
+        "input_icc_source": profile_source,
+        "input_icc_sha256": profile_sha256,
+        "working_color_space": "sRGB IEC61966-2.1",
+        "output_icc_sha256": hashlib.sha256(SRGB_PROFILE_BYTES).hexdigest(),
+    }
+
+
+def atomic_save(image: Image.Image, destination: Path, **save_options: Any) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent, prefix=f".{destination.name}.", delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        image.save(temporary_path, **save_options)
+        temporary_path.replace(destination)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def prepare_image(source: Path, destination: Path) -> dict[str, object]:
     with Image.open(source) as opened:
-        oriented = ImageOps.exif_transpose(opened).convert("RGB")
-        rgb = np.asarray(oriented)
+        oriented = ImageOps.exif_transpose(opened)
+        converted, color_profile = color_managed_rgb(oriented)
+        converted.load()
+        rgb = np.asarray(converted)
     corrected, color_metrics = robust_color_and_tone(rgb)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(corrected, "RGB").save(destination, format="PNG", compress_level=2)
+    atomic_save(
+        Image.fromarray(corrected, "RGB"),
+        destination,
+        format="PNG",
+        compress_level=2,
+        icc_profile=SRGB_PROFILE_BYTES,
+    )
     return {
         "source": str(source),
         "source_sha256": sha256(source),
         "prepared": str(destination),
         "input_width": int(rgb.shape[1]),
         "input_height": int(rgb.shape[0]),
+        "prepared_sha256": sha256(destination),
+        "preparation_version": PREPARATION_VERSION,
+        **color_profile,
         **color_metrics,
     }
 
@@ -169,11 +234,22 @@ def finish_image(restored: Path, master: Path, delivery: Path) -> dict[str, obje
     with Image.open(restored) as opened:
         rgb = np.asarray(opened.convert("RGB"))
     sharpened, focus_score = conservative_sharpen(rgb)
-    master.parent.mkdir(parents=True, exist_ok=True)
-    delivery.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(sharpened, "RGB").save(master, format="PNG", compress_level=4)
-    Image.fromarray(sharpened, "RGB").save(
-        delivery, format="JPEG", quality=95, subsampling=0, optimize=True
+    result = Image.fromarray(sharpened, "RGB")
+    atomic_save(
+        result,
+        master,
+        format="PNG",
+        compress_level=4,
+        icc_profile=SRGB_PROFILE_BYTES,
+    )
+    atomic_save(
+        result,
+        delivery,
+        format="JPEG",
+        quality=95,
+        subsampling=0,
+        optimize=True,
+        icc_profile=SRGB_PROFILE_BYTES,
     )
     return {
         "master": str(master),
@@ -182,6 +258,9 @@ def finish_image(restored: Path, master: Path, delivery: Path) -> dict[str, obje
         "output_height": int(rgb.shape[0]),
         "focus_score": focus_score,
         "master_sha256": sha256(master),
+        "delivery_sha256": sha256(delivery),
+        "output_color_space": "sRGB IEC61966-2.1",
+        "output_bit_depth": 8,
     }
 
 
@@ -198,7 +277,7 @@ def read_os_release() -> dict[str, str]:
     return values
 
 
-def detect_backend(torch_module: object) -> str | None:
+def detect_backend(torch_module: Any) -> str | None:
     if sys.platform == "darwin" and torch_module.backends.mps.is_available():
         return "mps"
     if sys.platform.startswith("linux") and torch_module.cuda.is_available():
@@ -207,8 +286,8 @@ def detect_backend(torch_module: object) -> str | None:
 
 
 def doctor(profile_names: list[str]) -> dict[str, object]:
-    import torch
     import psutil
+    import torch
 
     problems: list[str] = []
     backend = detect_backend(torch)
@@ -252,7 +331,7 @@ def doctor(profile_names: list[str]) -> dict[str, object]:
                     problems.append(
                         f"CUDA device 0 is not the expected RTX 4080: {selected_device['name']}"
                     )
-                selected_vram_gib = float(selected_device["vram_gib"])
+                selected_vram_gib = float(str(selected_device["vram_gib"]))
                 if not 11.0 <= selected_vram_gib <= 13.0:
                     problems.append(
                         f"CUDA device 0 reports {selected_vram_gib} GiB, "
@@ -276,9 +355,7 @@ def doctor(profile_names: list[str]) -> dict[str, object]:
         else:
             seedvr2_commit = commit_result.stdout.strip()
         if seedvr2_commit is not None and seedvr2_commit != SEEDVR2_COMMIT:
-            problems.append(
-                f"SeedVR2 checkout is at {seedvr2_commit}, expected {SEEDVR2_COMMIT}"
-            )
+            problems.append(f"SeedVR2 checkout is at {seedvr2_commit}, expected {SEEDVR2_COMMIT}")
     else:
         problems.append("SeedVR2 Git metadata is missing")
     requested_models = [PROFILES[name].model for name in profile_names]
@@ -333,9 +410,7 @@ def seedvr_arguments(
     ]
     if backend == "cuda":
         blocks_to_swap = (
-            profile.cuda_blocks_to_swap
-            if cuda_blocks_to_swap is None
-            else cuda_blocks_to_swap
+            profile.cuda_blocks_to_swap if cuda_blocks_to_swap is None else cuda_blocks_to_swap
         )
         arguments.extend(
             [
@@ -359,9 +434,7 @@ def seedvr_arguments(
 def collect_images(input_dir: Path, recursive: bool, limit: int | None) -> list[Path]:
     iterator = input_dir.rglob("*") if recursive else input_dir.glob("*")
     images = sorted(
-        path
-        for path in iterator
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        path for path in iterator if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
     if limit is not None:
         images = images[:limit]
@@ -375,6 +448,47 @@ def default_work_dir(output_dir: Path) -> Path:
     return output_dir.parent / f".{output_dir.name}-work"
 
 
+def output_paths(output_dir: Path, relative: Path) -> tuple[Path, Path]:
+    """Preserve the source extension so unlike source formats cannot collide."""
+    master = output_dir / "masters" / relative.parent / f"{relative.name}.png"
+    delivery = output_dir / "delivery" / relative.parent / f"{relative.name}.jpg"
+    return master, delivery
+
+
+def installed_versions() -> dict[str, str]:
+    packages = (
+        "numpy",
+        "opencv-python",
+        "pillow",
+        "scikit-image",
+        "torch",
+        "torchvision",
+    )
+    result: dict[str, str] = {}
+    for package in packages:
+        try:
+            result[package] = version(package)
+        except PackageNotFoundError:
+            result[package] = "not-installed"
+    return result
+
+
+def validate_output_targets(
+    output_dir: Path, input_dir: Path, images: list[Path], overwrite: bool
+) -> None:
+    targets: list[Path] = []
+    for source in images:
+        targets.extend(output_paths(output_dir, source.relative_to(input_dir)))
+    if len(targets) != len(set(targets)):
+        raise SystemExit("Multiple inputs resolve to the same final output path.")
+    existing = [target for target in targets if target.exists()]
+    if existing and not overwrite:
+        raise SystemExit(
+            f"Refusing to overwrite {len(existing)} existing output file(s); "
+            "use --overwrite after reviewing the destination."
+        )
+
+
 def load_preparation_cache(cache_path: Path) -> dict[str, dict[str, object]]:
     if not cache_path.is_file():
         return {}
@@ -382,7 +496,7 @@ def load_preparation_cache(cache_path: Path) -> dict[str, dict[str, object]]:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") != 2:
         return {}
     entries = payload.get("entries")
     if not isinstance(entries, dict):
@@ -390,15 +504,13 @@ def load_preparation_cache(cache_path: Path) -> dict[str, dict[str, object]]:
     return {key: value for key, value in entries.items() if isinstance(value, dict)}
 
 
-def save_preparation_cache(
-    cache_path: Path, entries: dict[str, dict[str, object]]
-) -> None:
+def save_preparation_cache(cache_path: Path, entries: dict[str, dict[str, object]]) -> None:
     """Atomically checkpoint preparation after each image."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w", dir=cache_path.parent, delete=False, encoding="utf-8"
     ) as temporary:
-        json.dump({"version": 1, "entries": entries}, temporary, indent=2)
+        json.dump({"version": 2, "entries": entries}, temporary, indent=2)
         temporary.write("\n")
         temporary_path = Path(temporary.name)
     temporary_path.replace(cache_path)
@@ -417,13 +529,16 @@ def cached_preparation(
         entry.get("source_size") != stat.st_size
         or entry.get("source_mtime_ns") != stat.st_mtime_ns
         or entry.get("prepared") != str(prepared)
+        or entry.get("preparation_version") != PREPARATION_VERSION
+        or entry.get("source_sha256") != sha256(source)
+        or entry.get("prepared_sha256") != sha256(prepared)
     ):
         return None
     return dict(entry)
 
 
 def run_seedvr_with_progress(
-    command: list[str], bucket_size: int, completed_before: int, progress: object
+    command: list[str], bucket_size: int, completed_before: int, progress: Progress
 ) -> None:
     """Stream SeedVR2 output while deriving whole-run progress from its file counter."""
     environment = os.environ.copy()
@@ -437,7 +552,9 @@ def run_seedvr_with_progress(
         text=True,
         bufsize=1,
     )
-    assert process.stdout is not None
+    if process.stdout is None:
+        process.kill()
+        raise RuntimeError("SeedVR2 output stream was not created")
     for line in process.stdout:
         print(line, end="", flush=True)
         match = re.search(r"Processing file (\d+)/(\d+)", line)
@@ -457,29 +574,45 @@ def run_seedvr_with_progress(
 def run(args: argparse.Namespace) -> dict[str, object]:
     if args.resolution_quantum <= 0:
         raise SystemExit("--resolution-quantum must be a positive integer")
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit("--limit must be a positive integer")
     if args.cuda_blocks_to_swap is not None and not 0 <= args.cuda_blocks_to_swap <= 32:
         raise SystemExit("--cuda-blocks-to-swap must be between 0 and 32")
-    input_dir = args.input_dir.resolve()
+    input_image_arg = getattr(args, "input_image", None)
+    if input_image_arg is not None:
+        input_image = input_image_arg.resolve()
+        if not input_image.is_file() or input_image.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise SystemExit(f"Input is not a supported image: {input_image}")
+        input_dir = input_image.parent
+        images = [input_image]
+    else:
+        input_image = None
+        input_dir_arg = getattr(args, "input_dir", None)
+        if input_dir_arg is None:
+            raise SystemExit("One of --input-image or --input-dir is required")
+        input_dir = input_dir_arg.resolve()
     output_dir = args.output_dir.resolve()
     work_dir = (
-        args.work_dir.resolve()
-        if args.work_dir is not None
-        else default_work_dir(output_dir)
+        args.work_dir.resolve() if args.work_dir is not None else default_work_dir(output_dir)
     )
     guard_paths(input_dir, output_dir, work_dir)
+    if input_image is None:
+        images = collect_images(input_dir, args.recursive, args.limit)
     profile = PROFILES[args.profile]
     installation = doctor([profile.name])
     backend = str(installation["backend"])
     if backend != "cuda" and args.cuda_blocks_to_swap is not None:
         raise SystemExit("--cuda-blocks-to-swap is only valid on the Bazzite CUDA host")
-    images = collect_images(input_dir, args.recursive, args.limit)
+    validate_output_targets(output_dir, input_dir, images, bool(getattr(args, "overwrite", False)))
 
     prepared_dir = work_dir / "prepared"
     seedvr_dir = work_dir / "seedvr2"
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_records: list[dict[str, object]] = []
     manifest: dict[str, object] = {
-        "pipeline": "local-slide-restoration-v2",
+        "pipeline": "local-slide-restoration-v3",
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "backend": backend,
         "profile": profile.name,
@@ -491,20 +624,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             else args.cuda_blocks_to_swap
         ),
         "input_dir": str(input_dir),
+        "input_image": str(input_image) if input_image is not None else None,
         "output_dir": str(output_dir),
         "work_dir": str(work_dir),
-        "files": [],
+        "software_versions": installed_versions(),
+        "preparation_version": PREPARATION_VERSION,
+        "files": manifest_records,
     }
 
     buckets: dict[int, list[dict[str, object]]] = {}
     from tqdm.auto import tqdm
 
-    for source in tqdm(
-        images, desc="Scanning image dimensions", unit="photo", dynamic_ncols=True
-    ):
+    for source in tqdm(images, desc="Scanning image dimensions", unit="photo", dynamic_ncols=True):
         relative = source.relative_to(input_dir)
-        with Image.open(source) as opened:
-            oriented_size = ImageOps.exif_transpose(opened).size
+        try:
+            with Image.open(source) as opened:
+                oriented_size = ImageOps.exif_transpose(opened).size
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Cannot read input image {source}: {error}") from error
         native_short_edge = min(oriented_size)
         model_resolution = max(
             1024,
@@ -526,10 +663,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     cache_path = work_dir / "preparation-cache.json"
     preparation_cache = load_preparation_cache(cache_path)
-    print(
-        f"Processing {len(images)} images in {len(buckets)} "
-        "native-resolution bucket(s)"
-    )
+    print(f"Processing {len(images)} images in {len(buckets)} native-resolution bucket(s)")
     restored_count = 0
     with tqdm(
         total=len(images),
@@ -550,11 +684,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 for item in preparation_progress:
                     source = item["source_path"]
                     prepared = item["prepared_path"]
-                    assert isinstance(source, Path)
-                    assert isinstance(prepared, Path)
-                    record = cached_preparation(
-                        source, prepared, preparation_cache
-                    )
+                    if not isinstance(source, Path) or not isinstance(prepared, Path):
+                        raise RuntimeError("Internal preparation record has invalid paths")
+                    record = cached_preparation(source, prepared, preparation_cache)
                     if record is not None:
                         cached_count += 1
                     else:
@@ -564,15 +696,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         record["source_mtime_ns"] = source_stat.st_mtime_ns
                         preparation_cache[str(source.resolve())] = dict(record)
                         save_preparation_cache(cache_path, preparation_cache)
-                    preparation_progress.set_postfix_str(
-                        f"{cached_count} cached", refresh=False
-                    )
+                    preparation_progress.set_postfix_str(f"{cached_count} cached", refresh=False)
                     record["relative"] = item["relative"]
                     record["prepared_name"] = item["prepared_name"]
                     record["native_short_edge"] = item["native_short_edge"]
                     record["model_resolution"] = model_resolution
                     records.append(record)
-                    manifest["files"].append(record)
+                    manifest_records.append(record)
 
             bucket_output = seedvr_dir / str(model_resolution)
             bucket_output.mkdir(parents=True, exist_ok=True)
@@ -612,20 +742,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 )
             restored_count += bucket_size
 
-    records = manifest["files"]
-    assert isinstance(records, list)
-    for record in tqdm(records, desc="Finalizing", unit="photo", dynamic_ncols=True):
-        assert isinstance(record, dict)
+    for record in tqdm(manifest_records, desc="Finalizing", unit="photo", dynamic_ncols=True):
         relative = Path(str(record["relative"]))
-        restored = (
-            seedvr_dir
-            / str(record["model_resolution"])
-            / str(record["prepared_name"])
-        )
+        restored = seedvr_dir / str(record["model_resolution"]) / str(record["prepared_name"])
         if not restored.is_file():
             raise SystemExit(f"SeedVR2 did not produce expected output: {restored}")
-        master = (output_dir / "masters" / relative).with_suffix(".png")
-        delivery = (output_dir / "delivery" / relative).with_suffix(".jpg")
+        master, delivery = output_paths(output_dir, relative)
         record.update(finish_image(restored, master, delivery))
 
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -639,9 +761,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     return manifest
 
 
-def compare_profile_outputs(
-    fp16_master: Path, fp8_master: Path
-) -> dict[str, float | None]:
+def compare_profile_outputs(fp16_master: Path, fp8_master: Path) -> dict[str, float | None]:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
     with Image.open(fp16_master) as opened:
@@ -663,9 +783,7 @@ def compare_profile_outputs(
         "mean_absolute_channel_difference": float(absolute_difference.mean()),
         "maximum_channel_difference": maximum_difference,
         "psnr_db": psnr,
-        "ssim": float(
-            structural_similarity(fp16, fp8, channel_axis=2, data_range=255)
-        ),
+        "ssim": float(structural_similarity(fp16, fp8, channel_axis=2, data_range=255)),
     }
 
 
@@ -682,11 +800,7 @@ def benchmark(args: argparse.Namespace) -> None:
             )
     output_dir = args.output_dir.resolve()
     work_dir = args.work_dir.resolve()
-    if (
-        output_dir == work_dir
-        or is_within(output_dir, work_dir)
-        or is_within(work_dir, output_dir)
-    ):
+    if output_dir == work_dir or is_within(output_dir, work_dir) or is_within(work_dir, output_dir):
         raise SystemExit("Benchmark output and work directories must be separate.")
     if is_within(source, output_dir) or is_within(source, work_dir):
         raise SystemExit("Benchmark input must be outside the output and work directories.")
@@ -701,6 +815,7 @@ def benchmark(args: argparse.Namespace) -> None:
     if sha256(source) != sha256(copied_input):
         raise SystemExit("Benchmark input copy failed SHA-256 verification.")
 
+    profile_results: dict[str, object] = {}
     results: dict[str, object] = {
         "pipeline": "local-slide-restoration-profile-benchmark-v1",
         "status": "running",
@@ -711,10 +826,8 @@ def benchmark(args: argparse.Namespace) -> None:
         "resolution_quantum": args.resolution_quantum,
         "execution_order": ["archival-fp16", "balanced-fp8"],
         "environment": installation,
-        "profiles": {},
+        "profiles": profile_results,
     }
-    profile_results = results["profiles"]
-    assert isinstance(profile_results, dict)
     masters: dict[str, Path] = {}
     failures: list[str] = []
     for profile_name in ("archival-fp16", "balanced-fp8"):
@@ -730,6 +843,7 @@ def benchmark(args: argparse.Namespace) -> None:
             resolution_quantum=args.resolution_quantum,
             profile=profile_name,
             cuda_blocks_to_swap=None,
+            overwrite=True,
         )
         started = time.perf_counter()
         try:
@@ -746,9 +860,12 @@ def benchmark(args: argparse.Namespace) -> None:
             continue
         elapsed_seconds = time.perf_counter() - started
         records = manifest["files"]
-        assert isinstance(records, list) and len(records) == 1
+        if not isinstance(records, list) or len(records) != 1:
+            raise RuntimeError("Benchmark run did not return exactly one file record")
         record = records[0]
-        assert isinstance(record, dict)
+        if not isinstance(record, dict):
+            raise RuntimeError("Benchmark file record is invalid")
+        record = cast(dict[str, object], record)
         master = Path(str(record["master"]))
         masters[profile_name] = master
         profile_results[profile_name] = {
@@ -792,26 +909,22 @@ def benchmark(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     subparsers = root.add_subparsers(dest="command", required=True)
-    doctor_parser = subparsers.add_parser(
-        "doctor", help="verify the complete local installation"
-    )
-    doctor_parser.add_argument(
-        "--profile", choices=PROFILES, default=DEFAULT_PROFILE
-    )
+    doctor_parser = subparsers.add_parser("doctor", help="verify the complete local installation")
+    doctor_parser.add_argument("--profile", choices=PROFILES, default=DEFAULT_PROFILE)
     doctor_parser.add_argument(
         "--all-profiles", action="store_true", help="verify both FP16 and FP8 models"
     )
-    run_parser = subparsers.add_parser("run", help="restore images from a copied input directory")
-    run_parser.add_argument("--input-dir", type=Path, required=True)
+    run_parser = subparsers.add_parser("run", help="restore one image or an image directory")
+    run_input = run_parser.add_mutually_exclusive_group(required=True)
+    run_input.add_argument("--input-dir", type=Path, help="source image directory")
+    run_input.add_argument("--input-image", type=Path, help="single source image")
     run_parser.add_argument("--output-dir", type=Path, required=True)
     run_parser.add_argument(
         "--work-dir",
         type=Path,
         help="intermediate directory (default: hidden sibling of OUTPUT_DIR)",
     )
-    run_parser.add_argument(
-        "--profile", choices=PROFILES, default=DEFAULT_PROFILE
-    )
+    run_parser.add_argument("--profile", choices=PROFILES, default=DEFAULT_PROFILE)
     run_parser.add_argument(
         "--cuda-blocks-to-swap",
         type=int,
@@ -824,6 +937,11 @@ def parser() -> argparse.ArgumentParser:
         help="include nested images (default: enabled; use --no-recursive to disable)",
     )
     run_parser.add_argument("--limit", type=int)
+    run_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace planned output files that already exist",
+    )
     run_parser.add_argument("--seed", type=int, default=42)
     run_parser.add_argument(
         "--resolution-quantum",

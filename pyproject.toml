@@ -27,3 +27,37 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "coverage>=7.10,<8",
+    "numpy>=2.2,<3",
+    "opencv-python-headless>=4.11",
+    "pillow>=11,<13",
+    "pip-audit>=2.9,<3",
+    "pytest>=8.4,<10",
+    "pytest-cov>=6.2,<8",
+    "ruff>=0.12,<1",
+    "scikit-image>=0.24,<1",
+    "ty>=0.0.11,<1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "PTH", "RUF"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["slide_pipeline"]
+
+[tool.coverage.report]
+fail_under = 35
+show_missing = true
