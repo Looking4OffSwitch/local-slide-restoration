@@ -32,7 +32,7 @@ require_command() {
 [[ "$(uname -s)" == "Linux" ]] || fail "This installer targets Bazzite Linux."
 [[ "$(uname -m)" == "x86_64" ]] || fail "This installer requires x86_64 Bazzite."
 [[ -r /etc/os-release ]] || fail "Cannot read /etc/os-release."
-OS_ID="$(awk -F= '$1 == "ID" {gsub(/\"/, "", $2); print $2}' /etc/os-release)"
+OS_ID="$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
 [[ "$OS_ID" == "bazzite" ]] || fail "This installer requires Bazzite (reported ID=$OS_ID)."
 [[ -f "$SCRIPT_DIR/slide_pipeline.py" ]] || \
   fail "Missing slide_pipeline.py next to this installer."
@@ -89,7 +89,7 @@ fi
 git -C "$VENDOR_DIR" checkout --detach "$SEEDVR2_COMMIT"
 
 log "Creating the Python 3.12 CUDA environment in user-writable storage"
-"$UV_BIN" python install 3.12
+"$UV_BIN" python install 3.12 --no-bin
 UV_PROJECT_ENVIRONMENT="$VENV_DIR" "$UV_BIN" sync \
   --project "$SCRIPT_DIR" \
   --python 3.12 \
@@ -127,4 +127,4 @@ SLIDE_PIPELINE_ROOT="$SCRIPT_DIR" \
   "$VENV_DIR/bin/python" "$SCRIPT_DIR/slide_pipeline.py" doctor --all-profiles
 
 log "Bazzite installation complete"
-log "Next: $SCRIPT_DIR/run_pipeline.sh benchmark --help"
+log "Next: $SCRIPT_DIR/run.sh benchmark --help"

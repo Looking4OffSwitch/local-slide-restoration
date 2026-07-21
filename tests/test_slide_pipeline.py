@@ -40,6 +40,63 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn("--swap_io_components", arguments)
 
 
+class OriginalSafetyTests(unittest.TestCase):
+    def test_repository_originals_directory_is_protected(self) -> None:
+        originals = (slide_pipeline.ROOT / "originals").resolve()
+        self.assertIn(originals, slide_pipeline.ORIGINAL_DIRS)
+
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            with self.assertRaisesRegex(SystemExit, "Refusing to process originals"):
+                slide_pipeline.guard_paths(
+                    originals,
+                    scratch / "output",
+                    scratch / "work",
+                )
+
+    def test_symlink_to_repository_originals_is_protected(self) -> None:
+        originals = (slide_pipeline.ROOT / "originals").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            linked_input = scratch / "input"
+            linked_input.symlink_to(originals, target_is_directory=True)
+            with self.assertRaisesRegex(SystemExit, "Refusing to process originals"):
+                slide_pipeline.guard_paths(
+                    linked_input,
+                    scratch / "output",
+                    scratch / "work",
+                )
+
+
+class CommandLineDefaultsTests(unittest.TestCase):
+    def test_run_only_requires_input_and_output(self) -> None:
+        arguments = slide_pipeline.parser().parse_args(
+            ["run", "--input-dir", "input", "--output-dir", "output"]
+        )
+        self.assertEqual(arguments.profile, "archival-fp16")
+        self.assertTrue(arguments.recursive)
+        self.assertIsNone(arguments.work_dir)
+
+    def test_recursion_can_be_disabled(self) -> None:
+        arguments = slide_pipeline.parser().parse_args(
+            [
+                "run",
+                "--input-dir",
+                "input",
+                "--output-dir",
+                "output",
+                "--no-recursive",
+            ]
+        )
+        self.assertFalse(arguments.recursive)
+
+    def test_default_work_directory_is_hidden_output_sibling(self) -> None:
+        output = Path("/jobs/restored")
+        self.assertEqual(
+            slide_pipeline.default_work_dir(output), Path("/jobs/.restored-work")
+        )
+
+
 class BenchmarkComparisonTests(unittest.TestCase):
     def test_identical_outputs_compare_as_identical(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

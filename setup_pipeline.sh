@@ -93,4 +93,4 @@ log "Running installation self-check"
 SLIDE_PIPELINE_ROOT="$SCRIPT_DIR" "$VENV_DIR/bin/python" "$SCRIPT_DIR/slide_pipeline.py" doctor
 
 log "Installation complete"
-log "Run: $SCRIPT_DIR/run_pipeline.sh --help"
+log "Run: $SCRIPT_DIR/run.sh --help"

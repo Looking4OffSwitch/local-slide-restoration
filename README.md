@@ -22,7 +22,8 @@ The pipeline applies:
 
 - Work only with copied photographs. Keep the originals and an independent backup.
 - Never point the output or working directories at the source-photo directory.
-- The pipeline refuses repository-local `manual/` and `machine/` source directories.
+- The pipeline refuses the repository-local `originals/` archive and the legacy
+  `manual/` and `machine/` source directories.
 - It refuses symlinked inputs that resolve into either protected directory.
 - It refuses an output or work directory nested beneath the input directory.
 - Model files, environments, working files, and image outputs are excluded by `.gitignore`.
@@ -78,7 +79,7 @@ Re-running `./setup_bazzite.sh` reuses valid downloads and checks the complete i
 Verify it independently with:
 
 ```bash
-./run_pipeline.sh doctor --all-profiles
+./run.sh doctor --all-profiles
 ```
 
 The report must identify `Bazzite`, backend `cuda`, the expected NVIDIA GPU, approximately 12 GB VRAM, 64 GB system RAM, both profiles, the pinned SeedVR2 commit, and the installed NVIDIA driver. If any value is wrong, stop before benchmarking.
@@ -95,7 +96,7 @@ cp -p /path/to/PICT0243.JPG "$HOME/slide-restoration-benchmark/input/"
 Then run both profiles with identical image, seed, and resolution rules:
 
 ```bash
-./run_pipeline.sh benchmark \
+./run.sh benchmark \
   --input-image "$HOME/slide-restoration-benchmark/input/PICT0243.JPG" \
   --output-dir "$HOME/slide-restoration-benchmark/output" \
   --work-dir "$HOME/slide-restoration-benchmark/work"
@@ -124,15 +125,14 @@ Review both PNG masters at full resolution. Do not choose a production profile f
 
 ## Run a production batch
 
-Create a copied-input directory, then select the reviewed profile explicitly on Bazzite:
+Create a copied-input directory. The quality-first FP16 profile and recursive discovery
+are the defaults, and the work directory defaults to a hidden sibling named
+`.output-work`:
 
 ```bash
-./run_pipeline.sh \
-  --profile archival-fp16 \
+./run.sh \
   --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output" \
-  --work-dir "$HOME/slide-restoration-job/work" \
-  --recursive
+  --output-dir "$HOME/slide-restoration-job/output"
 ```
 
 For the FP8 profile, replace `archival-fp16` with `balanced-fp8`.
@@ -140,7 +140,7 @@ For the FP8 profile, replace `archival-fp16` with `balanced-fp8`.
 The FP8 CUDA starting point uses 16 swapped blocks. If the Bazzite test produces a CUDA out-of-memory error, do not reduce archival resolution or change models silently. Retry deliberately with 24 and then 32 blocks:
 
 ```bash
-./run_pipeline.sh \
+./run.sh \
   --profile balanced-fp8 \
   --cuda-blocks-to-swap 24 \
   --input-dir "$HOME/slide-restoration-job/input" \
@@ -156,11 +156,10 @@ The existing Mac workflow remains FP16 by default:
 
 ```bash
 ./setup_pipeline.sh
-./run_pipeline.sh doctor
-./run_pipeline.sh \
+./run.sh doctor
+./run.sh \
   --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output" \
-  --work-dir "$HOME/slide-restoration-job/work"
+  --output-dir "$HOME/slide-restoration-job/output"
 ```
 
 Requirements are Apple Silicon, macOS, Git, internet access during installation, and approximately 10 GB for the FP16 installation plus working/output space. A 32 GB unified-memory Mac is recommended for full-resolution scans.
@@ -170,10 +169,10 @@ Requirements are Apple Silicon, macOS, Git, internet access during installation,
 ```text
 --input-dir PATH              Copied input directory (required for run)
 --output-dir PATH             Separate final-output directory (required)
---work-dir PATH               Separate intermediate directory (required)
+--work-dir PATH               Intermediate directory; defaults to .OUTPUT-work beside output
 --profile NAME                archival-fp16 or balanced-fp8
 --cuda-blocks-to-swap N       Explicit CUDA override, 0-32
---recursive                   Include supported nested images
+--recursive / --no-recursive  Include nested images; enabled by default
 --limit N                     Process the first N sorted images
 --seed N                      Deterministic SeedVR2 seed; default 42
 --resolution-quantum N        Native short-edge bucket; default 256

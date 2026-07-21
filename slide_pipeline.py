@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,9 @@ ROOT = Path(os.environ.get("SLIDE_PIPELINE_ROOT", Path(__file__).parent)).resolv
 STATE = ROOT / ".slide_pipeline"
 VENDOR = STATE / "vendor" / "seedvr2"
 MODELS = STATE / "models"
-ORIGINAL_DIRS = ((ROOT / "manual").resolve(), (ROOT / "machine").resolve())
+ORIGINAL_DIRS = tuple(
+    (ROOT / directory).resolve() for directory in ("originals", "manual", "machine")
+)
 SEEDVR2_COMMIT = "4490bd1f482e026674543386bb2a4d176da245b9"
 FP16_DIT_MODEL = "seedvr2_ema_3b_fp16.safetensors"
 FP8_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
@@ -372,6 +375,43 @@ def collect_images(input_dir: Path, recursive: bool, limit: int | None) -> list[
     return images
 
 
+def default_work_dir(output_dir: Path) -> Path:
+    """Keep intermediates beside, but separate from, the delivery directory."""
+    return output_dir.parent / f".{output_dir.name}-work"
+
+
+def run_seedvr_with_progress(
+    command: list[str], bucket_size: int, completed_before: int, progress: object
+) -> None:
+    """Stream SeedVR2 output while deriving whole-run progress from its file counter."""
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        command,
+        cwd=VENDOR,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        match = re.search(r"Processing file (\d+)/(\d+)", line)
+        if match is not None:
+            current = int(match.group(1))
+            reported_total = int(match.group(2))
+            if reported_total == bucket_size:
+                target = completed_before + current - 1
+                progress.update(max(0, target - progress.n))
+    return_code = process.wait()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+    target = completed_before + bucket_size
+    progress.update(max(0, target - progress.n))
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     if args.resolution_quantum <= 0:
         raise SystemExit("--resolution-quantum must be a positive integer")
@@ -379,7 +419,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise SystemExit("--cuda-blocks-to-swap must be between 0 and 32")
     input_dir = args.input_dir.resolve()
     output_dir = args.output_dir.resolve()
-    work_dir = args.work_dir.resolve()
+    work_dir = (
+        args.work_dir.resolve()
+        if args.work_dir is not None
+        else default_work_dir(output_dir)
+    )
     guard_paths(input_dir, output_dir, work_dir)
     profile = PROFILES[args.profile]
     installation = doctor([profile.name])
@@ -406,12 +450,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ),
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
+        "work_dir": str(work_dir),
         "files": [],
     }
 
     buckets: dict[int, list[dict[str, object]]] = {}
-    print(f"Preparing {len(images)} copied input images")
-    for source in images:
+    from tqdm.auto import tqdm
+
+    for source in tqdm(images, desc="Preparing", unit="photo", dynamic_ncols=True):
         resolved_source = source.resolve()
         for original in ORIGINAL_DIRS:
             if is_within(resolved_source, original):
@@ -439,35 +485,48 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         buckets.setdefault(model_resolution, []).append(record)
 
     print(f"Running SeedVR2 restoration in {len(buckets)} native-resolution bucket(s)")
-    for model_resolution in sorted(buckets):
-        bucket_input = prepared_dir / str(model_resolution)
-        bucket_output = seedvr_dir / str(model_resolution)
-        seed_command = [
-            sys.executable,
-            str(VENDOR / "inference_cli.py"),
-            str(bucket_input),
-            "--output",
-            str(bucket_output),
-            "--output_format",
-            "png",
-            "--model_dir",
-            str(MODELS),
-            "--resolution",
-            str(model_resolution),
-            "--batch_size",
-            "1",
-            "--seed",
-            str(args.seed),
-            "--color_correction",
-            "lab",
-            *seedvr_arguments(profile, backend, args.cuda_blocks_to_swap),
-        ]
-        subprocess.run(seed_command, cwd=VENDOR, check=True)
+    restored_count = 0
+    with tqdm(
+        total=len(images),
+        desc="Restoring",
+        unit="photo",
+        dynamic_ncols=True,
+    ) as restoration_progress:
+        for model_resolution in sorted(buckets):
+            bucket_input = prepared_dir / str(model_resolution)
+            bucket_output = seedvr_dir / str(model_resolution)
+            seed_command = [
+                sys.executable,
+                str(VENDOR / "inference_cli.py"),
+                str(bucket_input),
+                "--output",
+                str(bucket_output),
+                "--output_format",
+                "png",
+                "--model_dir",
+                str(MODELS),
+                "--resolution",
+                str(model_resolution),
+                "--batch_size",
+                "1",
+                "--seed",
+                str(args.seed),
+                "--color_correction",
+                "lab",
+                *seedvr_arguments(profile, backend, args.cuda_blocks_to_swap),
+            ]
+            bucket_size = len(buckets[model_resolution])
+            run_seedvr_with_progress(
+                seed_command,
+                bucket_size,
+                restored_count,
+                restoration_progress,
+            )
+            restored_count += bucket_size
 
     records = manifest["files"]
     assert isinstance(records, list)
-    print("Writing restored masters and delivery JPEGs")
-    for record in records:
+    for record in tqdm(records, desc="Finalizing", unit="photo", dynamic_ncols=True):
         assert isinstance(record, dict)
         relative = Path(str(record["relative"]))
         restored = (
@@ -657,7 +716,11 @@ def parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="restore images from a copied input directory")
     run_parser.add_argument("--input-dir", type=Path, required=True)
     run_parser.add_argument("--output-dir", type=Path, required=True)
-    run_parser.add_argument("--work-dir", type=Path, required=True)
+    run_parser.add_argument(
+        "--work-dir",
+        type=Path,
+        help="intermediate directory (default: hidden sibling of OUTPUT_DIR)",
+    )
     run_parser.add_argument(
         "--profile", choices=PROFILES, default=DEFAULT_PROFILE
     )
@@ -666,7 +729,12 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         help="override the selected profile's tested-starting-point BlockSwap value (0-32)",
     )
-    run_parser.add_argument("--recursive", action="store_true")
+    run_parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include nested images (default: enabled; use --no-recursive to disable)",
+    )
     run_parser.add_argument("--limit", type=int)
     run_parser.add_argument("--seed", type=int, default=42)
     run_parser.add_argument(
