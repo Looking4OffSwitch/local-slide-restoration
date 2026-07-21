@@ -1,0 +1,22 @@
+.DS_Store
+.slide_pipeline/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local source photographs and generated artifacts must never be committed.
+manual/
+machine/
+input/
+output/
+work/
+pipeline_samples/
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.webp
+*.heic
+*.mov
+*.mp4
