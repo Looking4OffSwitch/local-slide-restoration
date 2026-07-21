@@ -15,7 +15,7 @@ The pipeline applies:
 4. SeedVR2 restoration on MPS or CUDA.
 5. LAB perceptual color matching to preserve the source image's identity.
 6. Adaptive, edge-masked sharpening.
-7. Color-managed, lossless PNG processed master and high-quality JPEG delivery output.
+7. Color-managed lossless PNG output in `originals/` and high-quality JPEG output in `restored/`.
 8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
 
 Images are handled one native-resolution bucket at a time. The pipeline color
@@ -113,12 +113,12 @@ For the included 3312×2208 scan, the default resolution quantum requests a 3456
 ```text
 output/
 ├── archival-fp16/
-│   ├── delivery/
-│   ├── masters/
+│   ├── originals/
+│   ├── restored/
 │   └── manifest.json
 ├── balanced-fp8/
-│   ├── delivery/
-│   ├── masters/
+│   ├── originals/
+│   ├── restored/
 │   └── manifest.json
 └── benchmark.json
 ```
@@ -127,7 +127,7 @@ output/
 
 If either SeedVR2 run fails, the benchmark still attempts the other profile and writes a `partial` report containing the failed command and return code. It then exits unsuccessfully so a missing comparison cannot be mistaken for a completed benchmark.
 
-Review both PNG masters at full resolution. Do not choose a production profile from runtime alone.
+Review both PNG outputs at full resolution. Do not choose a production profile from runtime alone.
 
 ## Run a production batch
 
@@ -208,8 +208,8 @@ The resolution bucket is never lower than the native short edge. This avoids sil
 
 ```text
 output/
-├── delivery/       JPEG quality 95 with 4:4:4 chroma
-├── masters/        Lossless, 8-bit, sRGB-profiled PNG processed masters
+├── originals/      Lossless, 8-bit, sRGB-profiled PNG results
+├── restored/       JPEG quality 95 with 4:4:4 chroma
 └── manifest.json   Processing settings, measurements, and hashes
 ```
 
@@ -231,7 +231,7 @@ The settings are conservative, but SeedVR2 is generative:
 - Plausible but invented facial or object detail is possible.
 - FP8 uses lower-precision model weights and can differ from FP16.
 
-Review every master at full resolution. Preserve the physical slides and untouched digital captures independently.
+Review every PNG result at full resolution. Preserve the physical slides and untouched digital captures independently.
 
 ## Troubleshooting
 

@@ -38,7 +38,7 @@ FP8_DIT_MODEL = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
 VAE_MODEL = "ema_vae_fp16.safetensors"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 PREPARATION_VERSION = "color-tone-v2-icc-srgb"
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 SRGB_PROFILE = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
 SRGB_PROFILE_BYTES = SRGB_PROFILE.tobytes()
 
@@ -230,21 +230,21 @@ def prepare_image(source: Path, destination: Path) -> dict[str, object]:
     }
 
 
-def finish_image(restored: Path, master: Path, delivery: Path) -> dict[str, object]:
-    with Image.open(restored) as opened:
+def finish_image(seedvr_output: Path, original: Path, restored: Path) -> dict[str, object]:
+    with Image.open(seedvr_output) as opened:
         rgb = np.asarray(opened.convert("RGB"))
     sharpened, focus_score = conservative_sharpen(rgb)
     result = Image.fromarray(sharpened, "RGB")
     atomic_save(
         result,
-        master,
+        original,
         format="PNG",
         compress_level=4,
         icc_profile=SRGB_PROFILE_BYTES,
     )
     atomic_save(
         result,
-        delivery,
+        restored,
         format="JPEG",
         quality=95,
         subsampling=0,
@@ -252,13 +252,13 @@ def finish_image(restored: Path, master: Path, delivery: Path) -> dict[str, obje
         icc_profile=SRGB_PROFILE_BYTES,
     )
     return {
-        "master": str(master),
-        "delivery": str(delivery),
+        "original": str(original),
+        "restored": str(restored),
         "output_width": int(rgb.shape[1]),
         "output_height": int(rgb.shape[0]),
         "focus_score": focus_score,
-        "master_sha256": sha256(master),
-        "delivery_sha256": sha256(delivery),
+        "original_sha256": sha256(original),
+        "restored_sha256": sha256(restored),
         "output_color_space": "sRGB IEC61966-2.1",
         "output_bit_depth": 8,
     }
@@ -444,15 +444,15 @@ def collect_images(input_dir: Path, recursive: bool, limit: int | None) -> list[
 
 
 def default_work_dir(output_dir: Path) -> Path:
-    """Keep intermediates beside, but separate from, the delivery directory."""
+    """Keep intermediates beside, but separate from, the result directory."""
     return output_dir.parent / f".{output_dir.name}-work"
 
 
 def output_paths(output_dir: Path, relative: Path) -> tuple[Path, Path]:
     """Preserve the source extension so unlike source formats cannot collide."""
-    master = output_dir / "masters" / relative.parent / f"{relative.name}.png"
-    delivery = output_dir / "delivery" / relative.parent / f"{relative.name}.jpg"
-    return master, delivery
+    original = output_dir / "originals" / relative.parent / f"{relative.name}.png"
+    restored = output_dir / "restored" / relative.parent / f"{relative.name}.jpg"
+    return original, restored
 
 
 def installed_versions() -> dict[str, str]:
@@ -747,8 +747,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         restored = seedvr_dir / str(record["model_resolution"]) / str(record["prepared_name"])
         if not restored.is_file():
             raise SystemExit(f"SeedVR2 did not produce expected output: {restored}")
-        master, delivery = output_paths(output_dir, relative)
-        record.update(finish_image(restored, master, delivery))
+        original, restored_output = output_paths(output_dir, relative)
+        record.update(finish_image(restored, original, restored_output))
 
     manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     manifest_path = output_dir / "manifest.json"
@@ -761,12 +761,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     return manifest
 
 
-def compare_profile_outputs(fp16_master: Path, fp8_master: Path) -> dict[str, float | None]:
+def compare_profile_outputs(fp16_original: Path, fp8_original: Path) -> dict[str, float | None]:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-    with Image.open(fp16_master) as opened:
+    with Image.open(fp16_original) as opened:
         fp16 = np.asarray(opened.convert("RGB"))
-    with Image.open(fp8_master) as opened:
+    with Image.open(fp8_original) as opened:
         fp8 = np.asarray(opened.convert("RGB"))
     if fp16.shape != fp8.shape:
         raise SystemExit(
@@ -828,7 +828,7 @@ def benchmark(args: argparse.Namespace) -> None:
         "environment": installation,
         "profiles": profile_results,
     }
-    masters: dict[str, Path] = {}
+    originals: dict[str, Path] = {}
     failures: list[str] = []
     for profile_name in ("archival-fp16", "balanced-fp8"):
         profile_output = output_dir / profile_name
@@ -866,23 +866,23 @@ def benchmark(args: argparse.Namespace) -> None:
         if not isinstance(record, dict):
             raise RuntimeError("Benchmark file record is invalid")
         record = cast(dict[str, object], record)
-        master = Path(str(record["master"]))
-        masters[profile_name] = master
+        original = Path(str(record["original"]))
+        originals[profile_name] = original
         profile_results[profile_name] = {
             "status": "ok",
             "elapsed_seconds": elapsed_seconds,
             "elapsed_minutes": elapsed_seconds / 60.0,
             "model": manifest["dit_model"],
             "cuda_blocks_to_swap": manifest["cuda_blocks_to_swap"],
-            "master": str(master),
-            "master_sha256": record["master_sha256"],
+            "original": str(original),
+            "original_sha256": record["original_sha256"],
             "output_width": record["output_width"],
             "output_height": record["output_height"],
         }
 
     if not failures:
         results["output_comparison"] = compare_profile_outputs(
-            masters["archival-fp16"], masters["balanced-fp8"]
+            originals["archival-fp16"], originals["balanced-fp8"]
         )
         results["status"] = "ok"
     else:

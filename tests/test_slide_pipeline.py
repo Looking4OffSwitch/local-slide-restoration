@@ -195,7 +195,8 @@ class OutputSafetyTests(unittest.TestCase):
         jpg = slide_pipeline.output_paths(output, Path("same.jpg"))
         png = slide_pipeline.output_paths(output, Path("same.png"))
         self.assertNotEqual(jpg, png)
-        self.assertEqual(jpg[0], output / "masters" / "same.jpg.png")
+        self.assertEqual(jpg[0], output / "originals" / "same.jpg.png")
+        self.assertEqual(jpg[1], output / "restored" / "same.jpg.jpg")
 
     def test_existing_output_requires_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -205,9 +206,9 @@ class OutputSafetyTests(unittest.TestCase):
             input_dir.mkdir()
             source = input_dir / "scan.jpg"
             source.write_bytes(b"scan")
-            master, _ = slide_pipeline.output_paths(output_dir, Path("scan.jpg"))
-            master.parent.mkdir(parents=True)
-            master.write_bytes(b"existing")
+            original, _ = slide_pipeline.output_paths(output_dir, Path("scan.jpg"))
+            original.parent.mkdir(parents=True)
+            original.write_bytes(b"existing")
             with self.assertRaisesRegex(SystemExit, "Refusing to overwrite"):
                 slide_pipeline.validate_output_targets(
                     output_dir, input_dir, [source], overwrite=False
@@ -220,17 +221,17 @@ class ColorManagementTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source.png"
             prepared = root / "prepared.png"
-            master = root / "master.png"
-            delivery = root / "delivery.jpg"
+            original = root / "original.png"
+            restored = root / "restored.jpg"
             Image.new("RGB", (32, 32), (120, 80, 40)).save(source)
 
             record = slide_pipeline.prepare_image(source, prepared)
-            finished = slide_pipeline.finish_image(prepared, master, delivery)
+            finished = slide_pipeline.finish_image(prepared, original, restored)
 
             self.assertEqual(record["input_icc_source"], "assumed-srgb")
             self.assertIn("prepared_sha256", record)
-            self.assertIn("delivery_sha256", finished)
-            for path in (prepared, master, delivery):
+            self.assertIn("restored_sha256", finished)
+            for path in (prepared, original, restored):
                 with Image.open(path) as opened:
                     profile = opened.info.get("icc_profile")
                     self.assertIsNotNone(profile)
