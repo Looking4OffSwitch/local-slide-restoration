@@ -2,6 +2,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageCms
@@ -103,6 +104,13 @@ class CommandLineDefaultsTests(unittest.TestCase):
         self.assertEqual(arguments.input_image, Path("scan.jpg"))
         self.assertIsNone(arguments.input_dir)
 
+    def test_simple_mode_needs_no_output_directory(self) -> None:
+        arguments = slide_pipeline.parser().parse_args(
+            ["run", "--input-image", "scan.jpg", "--simple"]
+        )
+        self.assertTrue(arguments.simple)
+        self.assertIsNone(arguments.output_dir)
+
     def test_run_rejects_multiple_input_modes(self) -> None:
         with self.assertRaises(SystemExit):
             slide_pipeline.parser().parse_args(
@@ -133,6 +141,41 @@ class CommandLineDefaultsTests(unittest.TestCase):
     def test_default_work_directory_is_hidden_output_sibling(self) -> None:
         output = Path("/jobs/restored")
         self.assertEqual(slide_pipeline.default_work_dir(output), Path("/jobs/.restored-work"))
+
+
+class SimpleModeTests(unittest.TestCase):
+    def test_destination_uses_source_name_and_extension(self) -> None:
+        self.assertEqual(
+            slide_pipeline.simple_destination(Path("/photos/scan.JPEG")),
+            Path("/photos/scan_restored.JPEG"),
+        )
+
+    def test_missing_destination_needs_no_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "scan_restored.jpg"
+            with patch("builtins.input") as prompt:
+                self.assertTrue(slide_pipeline.confirm_simple_overwrite(destination))
+            prompt.assert_not_called()
+
+    def test_existing_destination_prompts_for_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "scan_restored.jpg"
+            destination.write_bytes(b"existing")
+            with patch("builtins.input", return_value="yes"):
+                self.assertTrue(slide_pipeline.confirm_simple_overwrite(destination))
+            with patch("builtins.input", return_value="no"):
+                self.assertFalse(slide_pipeline.confirm_simple_overwrite(destination))
+
+    def test_atomic_copy_replaces_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jpg"
+            destination = root / "nested" / "restored.jpg"
+            source.write_bytes(b"restored image")
+
+            slide_pipeline.atomic_copy(source, destination)
+
+            self.assertEqual(destination.read_bytes(), b"restored image")
 
 
 class PreparationCacheTests(unittest.TestCase):

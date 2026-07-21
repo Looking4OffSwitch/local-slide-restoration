@@ -154,8 +154,18 @@ one-file input directory:
   --output-dir "$HOME/slide-restoration-job/single-output"
 ```
 
-The same profile, seed, resolution, work-directory, and overwrite options used for
-batch restoration apply to single-image runs.
+This explicit-output form supports the same profile, seed, resolution, work-directory,
+and overwrite options used for batch restoration.
+
+For the simplest single-image workflow, use `--simple` instead of an output directory:
+
+```bash
+./run.sh --input-image "PICT0190.JPG" --simple
+```
+
+This writes `PICT0190_restored.JPG` beside the input image and creates no output
+directory tree. The original extension is preserved. If that destination already
+exists, `run.sh` asks before overwriting it.
 
 The FP8 CUDA starting point uses 16 swapped blocks. If the Bazzite test produces a CUDA out-of-memory error, do not reduce archival resolution or change models silently. Retry deliberately with 24 and then 32 blocks:
 
@@ -189,8 +199,9 @@ Requirements are Apple Silicon, macOS, Git, internet access during installation,
 ```text
 --input-dir PATH              Source image directory (mutually exclusive with --input-image)
 --input-image PATH            One source image (mutually exclusive with --input-dir)
---output-dir PATH             Separate final-output directory (required)
---work-dir PATH               Intermediate directory; defaults to .OUTPUT-work beside output
+--simple                      Write NAME_restored.EXT beside a single input image
+--output-dir PATH             Final-output directory (required unless --simple)
+--work-dir PATH               Intermediate directory; unavailable with --simple
 --profile NAME                archival-fp16 or balanced-fp8
 --cuda-blocks-to-swap N       Explicit CUDA override, 0-32
 --recursive / --no-recursive  Include nested images; enabled by default

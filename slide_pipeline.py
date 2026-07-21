@@ -203,6 +203,20 @@ def atomic_save(image: Image.Image, destination: Path, **save_options: Any) -> N
         raise
 
 
+def atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent, prefix=f".{destination.name}.", delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        shutil.copyfile(source, temporary_path)
+        temporary_path.replace(destination)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def prepare_image(source: Path, destination: Path) -> dict[str, object]:
     with Image.open(source) as opened:
         oriented = ImageOps.exif_transpose(opened)
@@ -591,6 +605,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if input_dir_arg is None:
             raise SystemExit("One of --input-image or --input-dir is required")
         input_dir = input_dir_arg.resolve()
+    if args.output_dir is None:
+        raise SystemExit("--output-dir is required unless --simple is used")
     output_dir = args.output_dir.resolve()
     work_dir = (
         args.work_dir.resolve() if args.work_dir is not None else default_work_dir(output_dir)
@@ -761,6 +777,86 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     return manifest
 
 
+def simple_destination(source: Path) -> Path:
+    return source.with_name(f"{source.stem}_restored{source.suffix}")
+
+
+def confirm_simple_overwrite(destination: Path) -> bool:
+    if not destination.exists():
+        return True
+    try:
+        answer = input(f"{destination} already exists. Overwrite it? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def simple(args: argparse.Namespace) -> Path:
+    if args.input_image is None:
+        raise SystemExit("--simple requires --input-image")
+    if args.output_dir is not None or args.work_dir is not None:
+        raise SystemExit("--simple cannot be combined with --output-dir or --work-dir")
+    if args.limit is not None:
+        raise SystemExit("--simple cannot be combined with --limit")
+    source = args.input_image.resolve()
+    if not source.is_file() or source.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise SystemExit(f"Input is not a supported image: {source}")
+    destination = simple_destination(source)
+    if not confirm_simple_overwrite(destination):
+        raise SystemExit("Restoration cancelled; existing output was not changed.")
+
+    with tempfile.TemporaryDirectory(prefix="slide-restoration-simple-") as temporary:
+        temporary_root = Path(temporary)
+        run_args = argparse.Namespace(
+            input_image=source,
+            input_dir=None,
+            output_dir=temporary_root / "output",
+            work_dir=temporary_root / "work",
+            recursive=False,
+            limit=None,
+            seed=args.seed,
+            resolution_quantum=args.resolution_quantum,
+            profile=args.profile,
+            cuda_blocks_to_swap=args.cuda_blocks_to_swap,
+            overwrite=True,
+        )
+        manifest = run(run_args)
+        records = manifest["files"]
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            raise RuntimeError("Simple restoration did not return exactly one file record")
+        record = cast(dict[str, object], records[0])
+        png_result = Path(str(record["original"]))
+        jpeg_result = Path(str(record["restored"]))
+        suffix = source.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            atomic_copy(jpeg_result, destination)
+        elif suffix == ".png":
+            atomic_copy(png_result, destination)
+        else:
+            with Image.open(png_result) as opened:
+                result = opened.convert("RGB")
+                result.load()
+            if suffix in {".tif", ".tiff"}:
+                atomic_save(
+                    result,
+                    destination,
+                    format="TIFF",
+                    compression="tiff_lzw",
+                    icc_profile=SRGB_PROFILE_BYTES,
+                )
+            else:
+                atomic_save(
+                    result,
+                    destination,
+                    format="WEBP",
+                    quality=95,
+                    method=6,
+                    icc_profile=SRGB_PROFILE_BYTES,
+                )
+    print(f"Restored image: {destination}")
+    return destination
+
+
 def compare_profile_outputs(fp16_original: Path, fp8_original: Path) -> dict[str, float | None]:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
@@ -918,7 +1014,12 @@ def parser() -> argparse.ArgumentParser:
     run_input = run_parser.add_mutually_exclusive_group(required=True)
     run_input.add_argument("--input-dir", type=Path, help="source image directory")
     run_input.add_argument("--input-image", type=Path, help="single source image")
-    run_parser.add_argument("--output-dir", type=Path, required=True)
+    run_parser.add_argument(
+        "--simple",
+        action="store_true",
+        help="restore one image beside the source as NAME_restored.EXT",
+    )
+    run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
         "--work-dir",
         type=Path,
@@ -971,6 +1072,8 @@ def main() -> None:
         doctor(list(PROFILES) if args.all_profiles else [args.profile])
     elif args.command == "benchmark":
         benchmark(args)
+    elif args.simple:
+        simple(args)
     else:
         run(args)
 
