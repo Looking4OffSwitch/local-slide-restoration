@@ -31,3 +31,5 @@ pipeline_samples/
 *.MOV
 *.mp4
 *.MP4
+*.zip
+*.ZIP

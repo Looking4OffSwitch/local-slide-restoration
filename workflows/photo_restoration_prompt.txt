@@ -1,0 +1,33 @@
+Restore the input photograph of an old photographic slide as a faithful, high-quality digital restoration.
+
+The input image is the only source of truth. Preserve the original people, identities, expressions, poses, clothing, objects, architecture, lighting, and composition. Do not reinterpret the scene or invent unsupported details. When a detail is uncertain, preserve that ambiguity.
+
+CROP AND GEOMETRY
+- Identify the photographic image inside the physical slide mount.
+- Remove the entire cardboard or plastic holder, all printed text and labels, rounded corners, and the dark border.
+- Fill the final canvas only with the restored photograph. Preserve every meaningful part of the photographed scene and every person.
+- Correct slight rotation, perspective, keystone, and lens distortion introduced when the slide was photographed.
+
+CAPTURE ARTIFACTS
+- Remove moire, screen-door grids, repetitive horizontal or vertical lines, color aliasing, rainbow interference, and pixel-frequency artifacts caused by photographing the slide.
+- Suppress those patterns without erasing real hair, fabric, masonry, foliage, window frames, facial contours, or period film texture.
+- Do not replace real detail with invented texture. Avoid waxy skin, painterly surfaces, plastic clothing, and artificially reconstructed faces.
+
+PHYSICAL DAMAGE
+- Remove dust, lint, fibers, hairs, white and black specks, fingerprints, stains, emulsion marks, and small scratches.
+- Repair only small isolated defects using nearby visual evidence. Preserve natural film character and do not erase genuine objects.
+
+COLOR, EXPOSURE, AND DETAIL
+- Correct age-related fading and color casts while preserving the original nighttime lighting and historical film character.
+- Restore believable skin tones and neutral whites, grays, and blacks where supported by the image. Use restrained saturation with no cinematic grading.
+- Correct glare, haze, vignetting, and uneven exposure conservatively. Recover shadow and highlight detail only where the source supports it; do not create artificial HDR.
+- Improve contrast and black levels while retaining dark-clothing and shaded-area detail.
+- Apply restrained sharpening only after artifact and noise removal. Avoid halos, crunchy edges, false pores, or false micro-detail.
+
+IDENTITY AND SCENE FIDELITY
+- Preserve every person's identity, facial structure, apparent age, expression, hairstyle, glasses, eye direction, pose, body proportions, clothing, jewelry, hats, party decorations, noisemakers, and accessories.
+- Do not beautify, de-age, reshape, slim, enlarge, modernize, add teeth, open closed eyes, remove glasses, modify hands, reconstruct obscured facial areas, or add or remove people.
+- Preserve all vehicles, buildings, doors, windows, masonry, plants, lights, decorations, furniture, and background objects in their original locations.
+- Preserve the original time of day and lighting. Do not modernize or turn the scene into an illustration, painting, composite, or newly staged photograph.
+
+Produce a clean, borderless, full-frame restored photograph that looks professionally scanned and carefully restored, not newly generated. Prioritize historical accuracy and identity preservation over dramatic enhancement. Return only the restored photograph with no labels, captions, borders, watermarks, frames, or comparison text.

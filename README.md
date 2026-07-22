@@ -1,69 +1,18 @@
 # Local Slide Restoration
 
-A guarded, local pipeline for restoring scanned photographic slides on:
+The production path is a local ComfyUI workflow using Qwen-Image-Edit-2511 and
+the official four-step Lightning adapter. It is designed for photographed slides that
+need the mount removed, geometry corrected, capture artifacts cleaned, and the original
+scene restored conservatively.
 
-- Apple Silicon macOS using PyTorch MPS; and
-- x86-64 Bazzite Linux using an NVIDIA CUDA GPU.
+The workflow does not run a post-restoration upscaler. Qwen normalizes the source to its
+native working resolution, performs the edit, and saves that result directly. The older
+SeedVR2 enhancement pipeline is still present for reproducibility, but it is not the
+production restoration solution.
 
-The macOS path was verified on an M2 Max with 32 GB unified memory. The Bazzite path is an initial implementation for a system with an RTX 4080-class GPU, 12 GB VRAM, 64 GB system RAM, and the current Bazzite-provided NVIDIA driver. It must be benchmarked on that PC before production use.
+## Test on the Bazzite RTX 4080 PC
 
-The pipeline applies:
-
-1. EXIF-aware orientation correction.
-2. Conservative, image-adaptive color-cast correction in linear RGB.
-3. Local contrast recovery in LAB color space.
-4. SeedVR2 restoration on MPS or CUDA.
-5. LAB perceptual color matching to preserve the source image's identity.
-6. Adaptive, edge-masked sharpening.
-7. Color-managed lossless PNG output in `originals/` and high-quality JPEG output in `restored/`.
-8. A JSON manifest with settings, dimensions, quality measurements, and SHA-256 hashes.
-
-Images are handled one internal resolution bucket at a time. The pipeline color
-corrects and converts a bucket, restores it with SeedVR2, and resizes the model result
-back to the EXIF-oriented input dimensions before sharpening and saving. Delivered
-images are never enlarged. Successfully prepared images are checkpointed in the work
-directory and reused after an interrupted run unless the source file changed.
-
-## Safety: originals are never output targets
-
-- The pipeline reads source photographs without modifying or deleting them. Keep an
-  independent backup of irreplaceable originals.
-- Never point the output or working directories at the source-photo directory.
-- The repository-local `originals/` archive and legacy `manual/` and `machine/`
-  directories are valid inputs, but cannot contain output or working directories.
-- It refuses an output or work directory nested beneath the input directory.
-- Model files, environments, working files, and image outputs are excluded by `.gitignore`.
-- Existing planned output files are refused unless `--overwrite` is explicitly supplied.
-
-## Restoration profiles
-
-Both profiles use the pinned 3B SeedVR2 architecture, the same FP16 VAE, the same seed, LAB color matching, tiled VAE encoding/decoding, and internal resolution bucketing.
-
-| Profile | DiT model | CUDA starting configuration | Purpose |
-|---|---|---|---|
-| `archival-fp16` | 3B FP16 | 32 BlockSwap blocks, CPU offload | Highest available model precision; existing Mac default |
-| `balanced-fp8` | 3B FP8 E4M3FN | 16 BlockSwap blocks, CPU offload | SeedVR2's recommended model class for 12–16 GB VRAM |
-
-The CUDA BlockSwap values are explicit starting configurations, not claims of optimal tuning. The benchmark records them. Do not interpret the FP8/FP16 comparison metrics as a quality score; they measure how different the two outputs are. Visual review determines whether either output is acceptable.
-
-SeedVR2's current hardware guidance is available in the [upstream project documentation](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler#requirements).
-
-## Bazzite requirements
-
-- Current x86-64 Bazzite NVIDIA image
-- Operational Bazzite-provided NVIDIA driver and `nvidia-smi`
-- NVIDIA CUDA-capable GPU; the initial target has 12 GB VRAM
-- 64 GB system RAM for model and tensor offloading on the initial target
-- Git, curl, and internet access during installation
-- At least 20 GB free for the CUDA environment, pinned SeedVR2 checkout, both DiT models, and the VAE, plus separate working/output space
-
-Bazzite supplies and updates NVIDIA drivers as part of its NVIDIA OS images. Do not install or replace the host driver for this pipeline. See the [Bazzite NVIDIA FAQ](https://docs.bazzite.gg/General/FAQ/#are-nvidia-graphics-card-drivers-pre-installed).
-
-The installer uses `uv` in user-writable storage and does not modify Bazzite's read-only system image. PyTorch's locked Linux wheels provide the matching user-space CUDA libraries; the host provides the NVIDIA driver.
-
-## Install on Bazzite
-
-Clone the repository on the Bazzite PC and run:
+On the PC:
 
 ```bash
 git clone https://github.com/Looking4OffSwitch/local-slide-restoration.git
@@ -71,202 +20,140 @@ cd local-slide-restoration
 ./setup_bazzite.sh
 ```
 
-The idempotent installer:
+The installer is idempotent and uses user-writable repository storage. It:
 
-- verifies Bazzite, x86-64, `nvidia-smi`, and required host commands;
-- reports the detected GPU, VRAM, and driver;
-- installs Python 3.12 and the locked CUDA-capable environment through `uv`;
-- checks out SeedVR2 at commit `4490bd1f482e026674543386bb2a4d176da245b9`;
-- downloads the 3B FP16 model, 3B FP8 model, and FP16 VAE;
-- verifies all three pinned SHA-256 hashes; and
-- runs the complete CUDA doctor for both profiles.
+- verifies x86-64 Bazzite, the NVIDIA driver, RTX 4080, approximately 12 GB VRAM,
+  at least 60 GiB usable system RAM, and at least 50 GiB free for the first installation;
+- installs pinned ComfyUI and ComfyUI-GGUF checkouts with a private Python environment;
+- downloads the shared Qwen encoder, VAE, and Lightning adapter;
+- downloads both Q4_K_S and Q4_K_M diffusion models and verifies every model SHA-256;
+- confirms that PyTorch in ComfyUI can actually access CUDA; and
+- runs the repository workflow/model doctor for both test profiles.
 
-Re-running `./setup_bazzite.sh` reuses valid downloads and checks the complete installation again.
+Bazzite owns the host NVIDIA driver. The installer does not replace or modify it.
+It installs the stable NVIDIA PyTorch package from the CUDA 13.0 index specified by the
+[ComfyUI system requirements](https://docs.comfy.org/installation/system_requirements).
 
-Verify it independently with:
-
-```bash
-./run.sh doctor --all-profiles
-```
-
-The report must identify `Bazzite`, backend `cuda`, the expected NVIDIA GPU, approximately 12 GB VRAM, 64 GB system RAM, both profiles, the pinned SeedVR2 commit, and the installed NVIDIA driver. If any value is wrong, stop before benchmarking.
-
-## Run the Bazzite FP16-versus-FP8 benchmark
-
-First make a copied input. This example uses the scanner image included in the working project, but the path on the Bazzite PC may differ:
+Copy the supplied `original.jpeg` to the PC, then run the real comparison:
 
 ```bash
-mkdir -p "$HOME/slide-restoration-benchmark/input"
-cp -p /path/to/PICT0243.JPG "$HOME/slide-restoration-benchmark/input/"
+./run.sh comfy-benchmark \
+  --input-image /path/to/original.jpeg \
+  --output-dir "$HOME/slide-restoration-test"
 ```
 
-Then run both profiles with identical image, seed, and resolution rules:
-
-```bash
-./run.sh benchmark \
-  --input-image "$HOME/slide-restoration-benchmark/input/PICT0243.JPG" \
-  --output-dir "$HOME/slide-restoration-benchmark/output" \
-  --work-dir "$HOME/slide-restoration-benchmark/work"
-```
-
-For the included 3312×2208 scan, SeedVR2 works internally at 3456×2304, but both
-saved results remain 3312×2208. The benchmark writes:
+This creates:
 
 ```text
-output/
-├── archival-fp16/
-│   ├── originals/
-│   ├── restored/
-│   └── manifest.json
-├── balanced-fp8/
-│   ├── originals/
-│   ├── restored/
-│   └── manifest.json
+slide-restoration-test/
+├── original_q4ks_restored.png
+├── original_q4km_restored.png
 └── benchmark.json
 ```
 
-`benchmark.json` records end-to-end time, model name, BlockSwap value, dimensions, hashes, mean absolute channel difference, PSNR, and SSIM. PSNR and SSIM compare the two generated outputs to each other; they do not establish that one is more faithful to the physical slide.
+`q4ks` is the smaller 12 GB-PC candidate. `q4km` is the Mac-tested quality reference
+that produced the strong restoration during development, but it may require more CUDA
+offloading. The PC comparison deliberately runs both rather than assuming either is the
+right production choice. `benchmark.json` records each model, output hash, output size,
+generation time, and total time. If a profile fails, the other is still attempted and
+the command exits unsuccessfully with the failure recorded.
 
-If either SeedVR2 run fails, the benchmark still attempts the other profile and writes a `partial` report containing the failed command and return code. It then exits unsuccessfully so a missing comparison cannot be mistaken for a completed benchmark.
+Review both images at full size for identity, composition, facial detail, invented
+content, mount removal, moire removal, exposure, and color. Do not start the 600-image
+batch until one profile passes that review and its measured PC time is acceptable.
 
-Review both PNG outputs at full resolution. Do not choose a production profile from runtime alone.
-
-## Run a production batch
-
-Create a copied-input directory. The quality-first FP16 profile and recursive discovery
-are the defaults, and the work directory defaults to a hidden sibling named
-`.output-work`:
-
-```bash
-./run.sh \
-  --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output"
-```
-
-For the FP8 profile, replace `archival-fp16` with `balanced-fp8`.
-
-## Restore one image
-
-Pass a supported JPEG, PNG, TIFF, or WebP directly without creating a temporary
-one-file input directory:
+Re-run the complete installation check at any time with:
 
 ```bash
-./run.sh \
-  --input-image "$HOME/slide-restoration-job/input/PICT0190.JPG" \
-  --output-dir "$HOME/slide-restoration-job/single-output"
+./run.sh comfy-doctor --all-profiles --require-bazzite-cuda
 ```
 
-This explicit-output form supports the same profile, seed, resolution, work-directory,
-and overwrite options used for batch restoration.
+## Restore one image after choosing a profile
 
-For the simplest single-image workflow, use `--simple` instead of an output directory:
+Profile selection is required so the software never silently chooses quality versus
+memory use:
 
 ```bash
-./run.sh --input-image "originals/machine/PICT0190.JPG" --simple
+./run.sh comfy \
+  --profile q4ks \
+  --input-image /path/to/copied-slide.jpeg \
+  --output-image /path/to/copied-slide_restored.png
 ```
 
-This writes `PICT0190_restored.JPG` in the current working directory and creates no
-output directory tree. It never writes beside the source or anywhere inside the
-repository's protected `originals/` archive. The original extension is preserved. If
-that destination already exists, `run.sh` asks before overwriting it.
+Use `--profile q4km` only if that is the result selected from the PC comparison. Existing
+outputs are refused unless `--overwrite` is supplied.
 
-The FP8 CUDA starting point uses 16 swapped blocks. If the Bazzite test produces a CUDA out-of-memory error, do not reduce archival resolution or change models silently. Retry deliberately with 24 and then 32 blocks:
+## Restore the 600-image batch
+
+Keep source copies and output in separate directories, then run one persistent ComfyUI
+process:
 
 ```bash
-./run.sh \
-  --profile balanced-fp8 \
-  --cuda-blocks-to-swap 24 \
-  --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output-fp8-24" \
-  --work-dir "$HOME/slide-restoration-job/work-fp8-24"
+./run.sh comfy-batch \
+  --profile q4ks \
+  --input-dir /path/to/copied-inputs \
+  --output-dir /path/to/restored-output
 ```
 
-The FP16 profile already starts at the maximum 32 blocks. If it still fails, preserve the error and hardware report for diagnosis rather than falling back to FP8 automatically.
+Replace `q4ks` with `q4km` if that profile wins the PC comparison. The model remains
+resident for the whole batch instead of being reloaded for every photograph. Discovery
+is recursive, relative subdirectories are preserved, and outputs are named
+`NAME_restored.png`. Existing results are skipped by default, so the same command resumes
+an interrupted batch. `restoration_manifest.json` records completed, skipped, and failed
+sources with per-image timings. A failed image does not stop the rest unless `--fail-fast`
+is supplied.
 
-## Install and run on Apple Silicon
+Use the benchmark's measured generation time—not a Mac estimate—to project the 600-image
+runtime on the RTX PC.
 
-The existing Mac workflow remains FP16 by default:
+## Inspect the ComfyUI graph
 
 ```bash
-./setup_pipeline.sh
-./run.sh doctor
-./run.sh \
-  --input-dir "$HOME/slide-restoration-job/input" \
-  --output-dir "$HOME/slide-restoration-job/output"
+./run.sh comfy-ui --profile q4ks
 ```
 
-Requirements are Apple Silicon, macOS, Git, internet access during installation, and approximately 10 GB for the FP16 installation plus working/output space. A 32 GB unified-memory Mac is recommended for full-resolution scans.
+Open `http://127.0.0.1:8188` and load
+`workflows/photo_restoration_qwen_2511.json`. The loadable graph mirrors the automated
+API graph in `workflows/photo_restoration_qwen_2511_api.json`. To inspect Q4_K_M, select
+`qwen-image-edit-2511-Q4_K_M.gguf` in the diffusion-model node.
 
-## Common command options
+The restoration instructions live in
+`workflows/photo_restoration_prompt.txt`. After editing them, regenerate the loadable
+canvas graph with:
 
-```text
---input-dir PATH              Source image directory (mutually exclusive with --input-image)
---input-image PATH            One source image (mutually exclusive with --input-dir)
---simple                      Write NAME_restored.EXT in the current directory
---output-dir PATH             Final-output directory (required unless --simple)
---work-dir PATH               Intermediate directory; unavailable with --simple
---profile NAME                archival-fp16 or balanced-fp8
---cuda-blocks-to-swap N       Explicit CUDA override, 0-32
---recursive / --no-recursive  Include nested images; enabled by default
---limit N                     Process the first N sorted images
---overwrite                   Replace planned outputs that already exist
---seed N                      Deterministic SeedVR2 seed; default 42
---resolution-quantum N        Native short-edge bucket; default 256
+```bash
+python3 tools/build_comfy_workflow.py
 ```
 
-Supported inputs are JPEG, PNG, TIFF, and WebP. Video files are not processed.
+## macOS compatibility
 
-The internal SeedVR2 bucket is never lower than the native short edge. After model
-processing, the result is returned to the original oriented dimensions; internal model
-bucketing never enlarges the saved image.
+The same graph and runner remain usable on Apple Silicon. A local Mac installation can
+be created with:
 
-## Output and reproducibility
-
-```text
-output/
-├── originals/      Lossless, 8-bit, sRGB-profiled PNG results
-├── restored/       JPEG quality 95 with 4:4:4 chroma
-└── manifest.json   Processing settings, measurements, and hashes
+```bash
+./setup_comfyui.sh --install-comfyui --model-set q4km
+./run.sh comfy-doctor --profile q4km
 ```
 
-Input ICC profiles are transformed to sRGB with LittleCMS. Untagged input is explicitly
-recorded as assumed sRGB. The work directory contains prepared color-corrected images and
-raw SeedVR2 output. It can be large and may be removed manually only after the final
-results have been reviewed and backed up. Untouched scans, rather than processed PNGs,
-remain the archival originals.
+This compatibility path does not change the production target: profile selection and
+performance acceptance are based on the Bazzite RTX 4080 test.
 
-Dependencies are declared in `pyproject.toml` and pinned transitively in `uv.lock`. SeedVR2 is pinned to a specific Git commit. Model downloads are verified against pinned hashes. The manifest records the backend, selected profile, model, CUDA BlockSwap value, input/output hashes, dimensions, timestamps, color measurements, and focus score.
+## Safety
 
-## Quality limits
+- The repository's `originals/` directory is permanently read-only source material.
+- Generated images, work files, models, manifests, and caches are never written there.
+- Single-image output cannot replace its source.
+- Batch output must be outside the batch input directory.
+- Models, environments, source photographs, generated images, and archives are ignored
+  by Git.
 
-The settings are conservative, but SeedVR2 is generative:
+## Legacy SeedVR2 path
 
-- Dust and scratches may remain.
-- Severe emulsion damage may require manual inpainting.
-- Strongly faded film stocks may need collection-specific color tuning.
-- Plausible but invented facial or object detail is possible.
-- FP8 uses lower-precision model weights and can differ from FP16.
-
-Review every PNG result at full resolution. Preserve the physical slides and untouched digital captures independently.
-
-## Troubleshooting
-
-### `Pipeline is not installed`
-
-Run `./setup_bazzite.sh` on Bazzite or `./setup_pipeline.sh` on Apple Silicon.
-
-### Bazzite doctor reports that CUDA is unavailable
-
-Confirm that `nvidia-smi` succeeds and that the PC is using the current Bazzite NVIDIA image. Do not install a separate NVIDIA driver over the Bazzite-managed driver.
-
-### CUDA out of memory
-
-Keep the copied input, resolution, seed, and profile fixed. For FP8, increase BlockSwap from 16 to 24 and then 32. FP16 already uses 32. Do not lower resolution unless consciously accepting a different archival result.
-
-### Pipeline refuses a path
-
-The path conflicts with a non-destructive safety rule. Create a new copied-input directory and separate output/work directories instead of bypassing the guard.
+The previous `slide_pipeline.py`, `setup_pipeline.sh`, and legacy `./run.sh` commands
+remain available for reproducing earlier enhancement tests. They are not used by any
+`comfy-*` command and are not the recommended solution for this project.
 
 ## License
 
-Original code in this repository is available under the MIT License. SeedVR2, model weights, and other third-party components retain their own licenses and usage terms.
+Original code in this repository is available under the MIT License. ComfyUI, custom
+nodes, and model weights retain their own licenses and usage terms.
