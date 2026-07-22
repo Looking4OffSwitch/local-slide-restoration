@@ -134,9 +134,12 @@ def resolve_python(comfy_root: Path, configured: Path | None) -> Path:
             comfy_root / "venv" / "Scripts" / "python.exe",
         ]
     for candidate in candidates:
-        resolved = candidate.expanduser().resolve()
-        if resolved.is_file() and os.access(resolved, os.X_OK):
-            return resolved
+        # Do not resolve symlinks here. Virtual-environment launchers are commonly
+        # symlinks to a base interpreter, and dereferencing one makes Python lose
+        # the venv's pyvenv.cfg and site-packages when ComfyUI is started.
+        executable = candidate.expanduser().absolute()
+        if executable.is_file() and os.access(executable, os.X_OK):
+            return executable
     if configured is None and Path(sys.executable).is_file():
         return Path(sys.executable)
     raise SystemExit("A working ComfyUI Python executable was not found; pass --comfyui-python.")
@@ -423,6 +426,42 @@ def execute_job(
         staged_input.unlink(missing_ok=True)
 
 
+def build_batch_server_command(
+    *,
+    python: Path,
+    comfy_root: Path,
+    port: int,
+    input_dir: Path,
+    output_dir: Path,
+    temp_dir: Path,
+    user_dir: Path,
+    extra_models: Path,
+) -> list[str]:
+    return [
+        str(python),
+        str(comfy_root / "main.py"),
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--input-directory",
+        str(input_dir),
+        "--output-directory",
+        str(output_dir),
+        "--temp-directory",
+        str(temp_dir),
+        "--user-directory",
+        str(user_dir),
+        "--database-url",
+        "sqlite:///:memory:",
+        "--extra-model-paths-config",
+        str(extra_models),
+        "--disable-all-custom-nodes",
+        "--whitelist-custom-nodes",
+        "ComfyUI-GGUF",
+    ]
+
+
 def execute_jobs(
     args: argparse.Namespace,
     comfy_root: Path,
@@ -458,27 +497,16 @@ def execute_jobs(
         extra_models = scratch / "extra_model_paths.yaml"
         write_extra_model_config(extra_models)
         base_url = f"http://127.0.0.1:{args.port}"
-        command = [
-            str(python),
-            str(comfy_root / "main.py"),
-            "--listen",
-            "127.0.0.1",
-            "--port",
-            str(args.port),
-            "--input-directory",
-            str(input_dir),
-            "--output-directory",
-            str(output_dir),
-            "--temp-directory",
-            str(temp_dir),
-            "--user-directory",
-            str(user_dir),
-            "--extra-model-paths-config",
-            str(extra_models),
-            "--disable-all-custom-nodes",
-            "--whitelist-custom-nodes",
-            "ComfyUI-GGUF",
-        ]
+        command = build_batch_server_command(
+            python=python,
+            comfy_root=comfy_root,
+            port=args.port,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            temp_dir=temp_dir,
+            user_dir=user_dir,
+            extra_models=extra_models,
+        )
         environment = os.environ.copy()
         if sys.platform == "darwin":
             environment.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")

@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -11,6 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ComfyWorkflowTests(unittest.TestCase):
+    def test_resolve_python_preserves_virtualenv_launcher_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            comfy_root = root / "ComfyUI"
+            launcher = comfy_root / ".venv" / "bin" / "python"
+            launcher.parent.mkdir(parents=True)
+            launcher.symlink_to(Path(sys.executable))
+
+            resolved = comfy_restore.resolve_python(comfy_root, None)
+
+            self.assertEqual(resolved, launcher.absolute())
+            self.assertNotEqual(resolved, launcher.resolve())
+            self.assertTrue(os.access(resolved, os.X_OK))
+
     def test_api_workflow_has_no_post_restoration_ai_upscaler(self) -> None:
         workflow = json.loads(comfy_restore.WORKFLOW.read_text(encoding="utf-8"))
         node_types = {node["class_type"] for node in workflow.values()}
@@ -59,6 +75,20 @@ class ComfyWorkflowTests(unittest.TestCase):
         q4km = comfy_restore.profile_configuration("q4km")[1]["diffusion model"]
         self.assertEqual(q4ks.name, "qwen-image-edit-2511-Q4_K_S.gguf")
         self.assertEqual(q4km.name, "qwen-image-edit-2511-Q4_K_M.gguf")
+
+    def test_batch_comfyui_uses_an_ephemeral_database(self) -> None:
+        command = comfy_restore.build_batch_server_command(
+            python=Path("/venv/python"),
+            comfy_root=Path("/ComfyUI"),
+            port=8189,
+            input_dir=Path("/scratch/input"),
+            output_dir=Path("/scratch/output"),
+            temp_dir=Path("/scratch/temp"),
+            user_dir=Path("/scratch/user"),
+            extra_models=Path("/scratch/models.yaml"),
+        )
+        database_option = command.index("--database-url")
+        self.assertEqual(command[database_option + 1], "sqlite:///:memory:")
 
 
 class BatchSafetyTests(unittest.TestCase):
