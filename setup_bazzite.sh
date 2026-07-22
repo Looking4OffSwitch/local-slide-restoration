@@ -88,4 +88,4 @@ log "Running the Bazzite, CUDA, workflow, node, and model self-check"
 "$SCRIPT_DIR/run.sh" comfy-doctor --all-profiles --require-bazzite-cuda
 
 log "Installation is complete."
-log "Next: ./run.sh comfy-benchmark --input-image /path/to/original.jpeg --output-dir \"$HOME/slide-restoration-test\""
+log "Next: ./run.sh --simple --input-image /path/to/original.jpeg"

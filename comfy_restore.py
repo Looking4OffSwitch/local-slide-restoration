@@ -382,6 +382,50 @@ def atomic_copy(source: Path, destination: Path) -> None:
         raise
 
 
+def atomic_convert(source: Path, destination: Path) -> None:
+    """Write a generated PNG using the destination's image format and extension."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.suffix.lower() == ".png":
+        atomic_copy(source, destination)
+        return
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise SystemExit(
+            "Pillow is missing from the ComfyUI environment; rerun ./setup_comfyui.sh."
+        ) from error
+
+    formats = {
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+        ".webp": "WEBP",
+    }
+    image_format = formats.get(destination.suffix.lower())
+    if image_format is None:
+        raise SystemExit(f"Unsupported simple output format: {destination.suffix}")
+
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=destination.suffix,
+        delete=False,
+    ) as temporary_output:
+        temporary_output_path = Path(temporary_output.name)
+    try:
+        with Image.open(source) as opened:
+            image = opened.convert("RGB") if image_format == "JPEG" else opened.copy()
+            save_options: dict[str, Any] = {"format": image_format}
+            if image_format == "JPEG":
+                save_options.update(quality=95, subsampling=0)
+            image.save(temporary_output_path, **save_options)
+        temporary_output_path.replace(destination)
+    except BaseException:
+        temporary_output_path.unlink(missing_ok=True)
+        raise
+
+
 def execute_job(
     *,
     base_url: str,
@@ -585,6 +629,34 @@ def restore(args: argparse.Namespace, comfy_root: Path, python: Path) -> Path:
     return destination
 
 
+def simple_destination(source: Path, cwd: Path | None = None) -> Path:
+    output_root = Path.cwd() if cwd is None else cwd
+    return (output_root / f"{source.stem}_restored{source.suffix}").resolve()
+
+
+def restore_simple(args: argparse.Namespace, comfy_root: Path, python: Path) -> Path:
+    started = time.monotonic()
+    source = args.input_image.expanduser().resolve()
+    if not source.is_file():
+        raise SystemExit(f"Input image does not exist: {source}")
+    if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise SystemExit(f"Unsupported input image format: {source.suffix}")
+    destination = simple_destination(source)
+    validate_destination(destination, source)
+    if destination.exists() and not args.overwrite:
+        raise SystemExit(f"Output exists; pass --overwrite after reviewing it: {destination}")
+
+    with tempfile.TemporaryDirectory(prefix="comfy-simple-output-") as temporary:
+        generated = Path(temporary) / "restored.png"
+        results = execute_jobs(args, comfy_root, python, [RestorationJob(source, generated)])
+        if results[0]["status"] != "completed":
+            raise SystemExit(results[0]["error"])
+        atomic_convert(generated, destination)
+    print(f"Restored image: {destination}")
+    print(f"Elapsed seconds: {time.monotonic() - started:.1f}")
+    return destination
+
+
 def restore_batch(args: argparse.Namespace, comfy_root: Path, python: Path) -> None:
     input_root = args.input_dir.expanduser().resolve()
     output_root = args.output_dir.expanduser().resolve()
@@ -747,6 +819,13 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--output-image", type=Path, required=True)
     add_generation_options(run)
     run.add_argument("--profile", choices=PROFILE_NAMES, required=True)
+    simple = subparsers.add_parser(
+        "simple", help="restore one image with Q4_K_S and write beside the caller"
+    )
+    add_runtime_paths(simple)
+    simple.add_argument("--input-image", type=Path, required=True)
+    add_generation_options(simple)
+    simple.set_defaults(profile="q4ks", fail_fast=False)
     batch = subparsers.add_parser(
         "batch", help="restore a directory while keeping ComfyUI and models resident"
     )
@@ -788,6 +867,8 @@ def main() -> None:
         restore_batch(args, comfy_root, python)
     elif args.command == "benchmark":
         benchmark(args, comfy_root, python)
+    elif args.command == "simple":
+        restore_simple(args, comfy_root, python)
     else:
         restore(args, comfy_root, python)
 

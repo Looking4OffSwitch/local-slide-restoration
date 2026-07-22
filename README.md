@@ -6,11 +6,10 @@ need the mount removed, geometry corrected, capture artifacts cleaned, and the o
 scene restored conservatively.
 
 The workflow does not run a post-restoration upscaler. Qwen normalizes the source to its
-native working resolution, performs the edit, and saves that result directly. The older
-SeedVR2 enhancement pipeline is still present for reproducibility, but it is not the
-production restoration solution.
+native working resolution, performs the edit, and saves that result directly. ComfyUI is
+the only restoration engine in this repository.
 
-## Test on the Bazzite RTX 4080 PC
+## Install on the Bazzite RTX 4080 PC
 
 On the PC:
 
@@ -34,7 +33,23 @@ Bazzite owns the host NVIDIA driver. The installer does not replace or modify it
 It installs the stable NVIDIA PyTorch package from the CUDA 13.0 index specified by the
 [ComfyUI system requirements](https://docs.comfy.org/installation/system_requirements).
 
-Copy the supplied `original.jpeg` to the PC, then run the real comparison:
+## Restore one image
+
+Run the simple command from the directory where the restored image should be written:
+
+```bash
+./run.sh --simple --input-image originals/manual/IMG_6219.jpeg
+```
+
+This always uses the Q4_K_S ComfyUI profile and writes
+`IMG_6219_restored.jpeg` to the caller's current directory. The output keeps the source
+extension and contains image data in that actual format. Existing output is refused
+unless `--overwrite` is supplied. Nothing is written inside the protected `originals/`
+archive.
+
+## Compare both model profiles
+
+To make a deliberate quality comparison between both installed model profiles:
 
 ```bash
 ./run.sh comfy-benchmark \
@@ -68,10 +83,9 @@ Re-run the complete installation check at any time with:
 ./run.sh comfy-doctor --all-profiles --require-bazzite-cuda
 ```
 
-## Restore one image after choosing a profile
+## Advanced single-image usage
 
-Profile selection is required so the software never silently chooses quality versus
-memory use:
+The explicit command remains available when a PNG output path or Q4_K_M is required:
 
 ```bash
 ./run.sh comfy \
@@ -80,8 +94,7 @@ memory use:
   --output-image /path/to/copied-slide_restored.png
 ```
 
-Use `--profile q4km` only if that is the result selected from the PC comparison. Existing
-outputs are refused unless `--overwrite` is supplied.
+Use `--profile q4km` only if that is the result selected from the PC comparison.
 
 ## Restore the 600-image batch
 
@@ -146,12 +159,6 @@ performance acceptance are based on the Bazzite RTX 4080 test.
 - Batch output must be outside the batch input directory.
 - Models, environments, source photographs, generated images, and archives are ignored
   by Git.
-
-## Legacy SeedVR2 path
-
-The previous `slide_pipeline.py`, `setup_pipeline.sh`, and legacy `./run.sh` commands
-remain available for reproducing earlier enhancement tests. They are not used by any
-`comfy-*` command and are not the recommended solution for this project.
 
 ## License
 

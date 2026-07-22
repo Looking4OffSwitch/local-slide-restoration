@@ -7,12 +7,41 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 import comfy_restore
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ComfyWorkflowTests(unittest.TestCase):
+    def test_simple_parser_needs_only_an_input_image(self) -> None:
+        args = comfy_restore.parser().parse_args(
+            ["simple", "--input-image", "originals/manual/IMG_6219.jpeg"]
+        )
+        self.assertEqual(args.profile, "q4ks")
+        self.assertEqual(args.steps, 4)
+        self.assertFalse(args.overwrite)
+
+    def test_simple_destination_uses_caller_directory_and_source_extension(self) -> None:
+        destination = comfy_restore.simple_destination(
+            Path("/archive/IMG_6219.jpeg"), Path("/caller")
+        )
+        self.assertEqual(destination, Path("/caller/IMG_6219_restored.jpeg"))
+
+    def test_atomic_convert_writes_real_jpeg_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "generated.png"
+            destination = root / "restored.jpeg"
+            Image.new("RGB", (8, 6), "navy").save(source)
+
+            comfy_restore.atomic_convert(source, destination)
+
+            with Image.open(destination) as restored:
+                self.assertEqual(restored.format, "JPEG")
+                self.assertEqual(restored.size, (8, 6))
+
     def test_resolve_python_preserves_virtualenv_launcher_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

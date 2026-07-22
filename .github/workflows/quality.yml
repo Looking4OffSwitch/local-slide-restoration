@@ -19,8 +19,8 @@ jobs:
       - run: uv sync --locked --only-group dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run ty check --python .venv slide_pipeline.py
+      - run: uv run ty check --python .venv comfy_restore.py
       - run: uv run pytest --cov --cov-report=term-missing
       - run: uv export --frozen --no-emit-project | uv run pip-audit -r /dev/stdin --disable-pip
-      - run: bash -n run.sh setup_pipeline.sh setup_bazzite.sh
-      - run: shellcheck run.sh setup_pipeline.sh setup_bazzite.sh
+      - run: bash -n run.sh setup_bazzite.sh setup_comfyui.sh
+      - run: shellcheck run.sh setup_bazzite.sh setup_comfyui.sh
