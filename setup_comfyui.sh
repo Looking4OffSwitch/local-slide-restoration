@@ -6,6 +6,8 @@ STATE_DIR="$SCRIPT_DIR/.slide_pipeline"
 MODEL_DIR="$STATE_DIR/comfyui_models"
 COMFYUI_COMMIT="8b099de36acd81acd1afa3b5442951dc847e0a52"
 GGUF_COMMIT="6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+ESDNET_COMMIT="fa70a92d3d4f35d5c4e3fa7a54e3b2e5b995f1cd"
+ESDNET_SHA256="254235cd25f90a3f1785885385dc6cb3f2178e053291ab53d1943bd7c2f7de65"
 
 usage() {
   cat <<'EOF'
@@ -187,8 +189,10 @@ if [[ "$(git -C "$gguf_dir" rev-parse HEAD)" != "$GGUF_COMMIT" ]]; then
 fi
 if command -v uv >/dev/null 2>&1; then
   uv pip install --python "$comfy_python" -r "$gguf_dir/requirements.txt"
+  uv pip install --python "$comfy_python" gdown
 else
   "$comfy_python" -m pip install -r "$gguf_dir/requirements.txt"
+  "$comfy_python" -m pip install gdown
 fi
 
 sha256_file() {
@@ -226,6 +230,33 @@ download_model() {
   fi
   mv "$partial" "$destination"
 }
+
+esdnet_dir="$STATE_DIR/third_party/ESDNet"
+if [[ ! -d "$esdnet_dir/.git" ]]; then
+  mkdir -p "$(dirname "$esdnet_dir")"
+  git clone https://github.com/CVMI-Lab/UHDM.git "$esdnet_dir"
+fi
+if [[ "$(git -C "$esdnet_dir" rev-parse HEAD)" != "$ESDNET_COMMIT" ]]; then
+  if ! git -C "$esdnet_dir" diff --quiet || ! git -C "$esdnet_dir" diff --cached --quiet; then
+    printf 'Refusing to change a modified ESDNet checkout: %s\n' "$esdnet_dir" >&2
+    exit 1
+  fi
+  git -C "$esdnet_dir" fetch --depth 1 origin "$ESDNET_COMMIT"
+  git -C "$esdnet_dir" checkout --detach "$ESDNET_COMMIT"
+fi
+esdnet_model="$STATE_DIR/restoration_models/esdnet_uhdm.pth"
+mkdir -p "$(dirname "$esdnet_model")"
+if [[ ! -f "$esdnet_model" || "$(sha256_file "$esdnet_model")" != "$ESDNET_SHA256" ]]; then
+  rm -f "$esdnet_model"
+  "$comfy_python" -m gdown \
+    'https://drive.google.com/uc?id=1HT_ubcAYRqzFIJ46XuPhrulJk2YFBIEl' \
+    -O "$esdnet_model"
+fi
+if [[ "$(sha256_file "$esdnet_model")" != "$ESDNET_SHA256" ]]; then
+  printf '%s\n' 'ESDNet checksum mismatch after download.' >&2
+  exit 1
+fi
+printf 'Verified: %s\n' "restoration_models/esdnet_uhdm.pth"
 
 if [[ "$model_set" == "q4ks" || "$model_set" == "comparison" ]]; then
   download_model \

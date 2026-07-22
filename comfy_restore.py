@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parent
 WORKFLOW = ROOT / "workflows" / "photo_restoration_qwen_2511_api.json"
 DEFAULT_PROMPT = ROOT / "workflows" / "photo_restoration_prompt.txt"
 MODEL_ROOT = ROOT / ".slide_pipeline" / "comfyui_models"
+ESDNET_ROOT = ROOT / ".slide_pipeline" / "third_party" / "ESDNet"
+ESDNET_MODEL = ROOT / ".slide_pipeline" / "restoration_models" / "esdnet_uhdm.pth"
+ESDNET_COMMIT = "fa70a92d3d4f35d5c4e3fa7a54e3b2e5b995f1cd"
+ESDNET_SHA256 = "254235cd25f90a3f1785885385dc6cb3f2178e053291ab53d1943bd7c2f7de65"
 COMFYUI_COMMIT = "8b099de36acd81acd1afa3b5442951dc847e0a52"
 GGUF_COMMIT = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
 SHARED_MODEL_FILES = {
@@ -58,6 +62,7 @@ QWEN_Q4KM_MODEL_SHA256 = {
 MODEL_FILES = QWEN_Q4KS_MODEL_FILES
 MODEL_SHA256 = QWEN_Q4KS_MODEL_SHA256
 PROFILE_NAMES = ("q4ks", "q4km")
+ENGINE_NAMES = ("fidelity", "qwen")
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 PROTECTED_ORIGINALS = (ROOT / "originals").resolve()
 
@@ -426,6 +431,185 @@ def atomic_convert(source: Path, destination: Path) -> None:
         raise
 
 
+def _edge_crop_box(image: Any) -> tuple[int, int, int, int]:
+    """Conservatively trim only flat, dark mount material touching an image edge."""
+    import numpy as np
+
+    sample = np.asarray(image.resize((min(image.width, 1024), min(image.height, 1024))))
+    gray = sample.astype(np.float32).mean(axis=2)
+    height, width = gray.shape
+    limits = (int(width * 0.08), int(height * 0.08))
+
+    def trim(lines: Any, limit: int) -> int:
+        for index in range(limit):
+            line = lines[index]
+            inner = lines[min(index + max(3, limit // 8), len(lines) - 1)]
+            flat_dark = float(np.percentile(line, 90)) < 42 and float(line.std()) < 22
+            separated = float(inner.mean() - line.mean()) > 18 or float(inner.std()) > line.std() + 12
+            if not (flat_dark and separated):
+                return index
+        return 0
+
+    left = trim(gray.T, limits[0])
+    right = trim(gray[:, ::-1].T, limits[0])
+    top = trim(gray, limits[1])
+    bottom = trim(gray[::-1], limits[1])
+    scale_x = image.width / width
+    scale_y = image.height / height
+    return (
+        round(left * scale_x),
+        round(top * scale_y),
+        image.width - round(right * scale_x),
+        image.height - round(bottom * scale_y),
+    )
+
+
+def _esdnet_demoire(image: Any, max_dimension: int) -> Any:
+    """Run the pinned Apache-2.0 ESDNet UHDM model without generative priors."""
+    import importlib.util
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as functional
+    from PIL import Image
+
+    if sha256_file(ESDNET_MODEL) != ESDNET_SHA256:
+        raise SystemExit(f"ESDNet model checksum mismatch: {ESDNET_MODEL}")
+    if git_head(ESDNET_ROOT) != ESDNET_COMMIT:
+        raise SystemExit(f"ESDNet checkout does not match the pinned commit: {ESDNET_ROOT}")
+
+    module_path = ESDNET_ROOT / "model" / "nets.py"
+    spec = importlib.util.spec_from_file_location("slide_esdnet", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load ESDNet code: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    model = module.my_model(48, 32, 64, 32, 1)
+    state = torch.load(ESDNET_MODEL, map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    scale = min(1.0, max_dimension / max(image.size))
+    if scale < 1.0:
+        image = image.resize(
+            (round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS
+        )
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device)
+    height, width = tensor.shape[-2:]
+    pad_height = (32 - height % 32) % 32
+    pad_width = (32 - width % 32) % 32
+    tensor = functional.pad(
+        tensor,
+        (pad_width // 2, pad_width - pad_width // 2, pad_height // 2, pad_height - pad_height // 2),
+        mode="reflect",
+    )
+    with torch.inference_mode():
+        restored = model(tensor)[0]
+    restored = restored[
+        :,
+        :,
+        pad_height // 2 : pad_height // 2 + height,
+        pad_width // 2 : pad_width // 2 + width,
+    ]
+    output = restored.squeeze(0).permute(1, 2, 0).float().clamp(0, 1).cpu().numpy()
+    return Image.fromarray(np.round(output * 255).astype(np.uint8), "RGB")
+
+
+def fidelity_restore_image(
+    source: Path,
+    destination: Path,
+    *,
+    max_dimension: int = 1200,
+    demoire: str = "auto",
+) -> dict[str, Any]:
+    """Restore capture artifacts without a generative model or face reconstruction."""
+    import numpy as np
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+    started = time.monotonic()
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+    original_size = image.size
+    crop_box = _edge_crop_box(image)
+    cropped_area = (crop_box[2] - crop_box[0]) * (crop_box[3] - crop_box[1])
+    if cropped_area >= image.width * image.height * 0.88:
+        image = image.crop(crop_box)
+    else:
+        crop_box = (0, 0, image.width, image.height)
+
+    use_esdnet = demoire in {"auto", "esdnet"} and ESDNET_ROOT.is_dir() and ESDNET_MODEL.is_file()
+    if demoire == "esdnet" and not use_esdnet:
+        raise SystemExit("ESDNet is not installed; rerun ./setup_comfyui.sh.")
+    if use_esdnet:
+        image = _esdnet_demoire(image, max_dimension)
+        demoire_engine = "esdnet"
+    else:
+        # Safe fallback when the dedicated model is not installed.
+        scale = min(1.0, max_dimension / max(image.size))
+        if scale < 1.0:
+            preblur_radius = max(0.65, 0.9 / scale)
+            image = image.filter(ImageFilter.GaussianBlur(preblur_radius))
+            image = image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        demoire_engine = "source_filter"
+
+    # Restrained gray-world correction. Clamp channel gains so intentional scene
+    # lighting cannot be neutralized into a different time of day.
+    pixels = np.asarray(image, dtype=np.float32)
+    medians = np.median(pixels.reshape(-1, 3), axis=0)
+    neutral = float(np.median(medians))
+    gains = np.clip(neutral / np.maximum(medians, 1.0), 0.88, 1.14)
+    gains = 1.0 + (gains - 1.0) * 0.65
+    corrected = np.clip(pixels * gains, 0, 255).astype(np.uint8)
+    image = Image.fromarray(corrected, "RGB")
+
+    contrasted = ImageOps.autocontrast(image, cutoff=0.35, preserve_tone=True)
+    image = Image.blend(image, contrasted, 0.28)
+    image = ImageEnhance.Color(image).enhance(0.96)
+    image = image.filter(ImageFilter.UnsharpMask(radius=1.15, percent=55, threshold=4))
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=destination.suffix,
+        delete=False,
+    ) as temporary_output:
+        temporary_path = Path(temporary_output.name)
+    try:
+        image_format = {
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".png": "PNG",
+            ".tif": "TIFF",
+            ".tiff": "TIFF",
+            ".webp": "WEBP",
+        }.get(destination.suffix.lower())
+        if image_format is None:
+            raise SystemExit(f"Unsupported output image format: {destination.suffix}")
+        options: dict[str, Any] = {"format": image_format}
+        if image_format == "JPEG":
+            options.update(quality=95, subsampling=0)
+        image.save(temporary_path, **options)
+        temporary_path.replace(destination)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return {
+        "engine": "fidelity",
+        "demoire_engine": demoire_engine,
+        "source_size": list(original_size),
+        "crop_box": list(crop_box),
+        "output_size": list(image.size),
+        "channel_gains": [round(float(gain), 4) for gain in gains],
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+    }
+
+
 def execute_job(
     *,
     base_url: str,
@@ -646,12 +830,18 @@ def restore_simple(args: argparse.Namespace, comfy_root: Path, python: Path) -> 
     if destination.exists() and not args.overwrite:
         raise SystemExit(f"Output exists; pass --overwrite after reviewing it: {destination}")
 
-    with tempfile.TemporaryDirectory(prefix="comfy-simple-output-") as temporary:
-        generated = Path(temporary) / "restored.png"
-        results = execute_jobs(args, comfy_root, python, [RestorationJob(source, generated)])
-        if results[0]["status"] != "completed":
-            raise SystemExit(results[0]["error"])
-        atomic_convert(generated, destination)
+    if args.engine == "fidelity":
+        report = fidelity_restore_image(
+            source, destination, max_dimension=args.max_dimension, demoire=args.demoire
+        )
+        print(json.dumps(report, indent=2))
+    else:
+        with tempfile.TemporaryDirectory(prefix="comfy-simple-output-") as temporary:
+            generated = Path(temporary) / "restored.png"
+            results = execute_jobs(args, comfy_root, python, [RestorationJob(source, generated)])
+            if results[0]["status"] != "completed":
+                raise SystemExit(results[0]["error"])
+            atomic_convert(generated, destination)
     print(f"Restored image: {destination}")
     print(f"Elapsed seconds: {time.monotonic() - started:.1f}")
     return destination
@@ -694,11 +884,47 @@ def restore_batch(args: argparse.Namespace, comfy_root: Path, python: Path) -> N
             jobs.append(RestorationJob(source, destination))
     output_root.mkdir(parents=True, exist_ok=True)
     if jobs:
-        results.extend(execute_jobs(args, comfy_root, python, jobs))
+        if args.engine == "fidelity":
+            for index, job in enumerate(jobs, start=1):
+                started = time.monotonic()
+                print(f"[{index}/{len(jobs)}] Restoring {job.source}", flush=True)
+                try:
+                    details = fidelity_restore_image(
+                        job.source,
+                        job.destination,
+                        max_dimension=args.max_dimension,
+                        demoire=args.demoire,
+                    )
+                    status = "completed"
+                    error = None
+                    print(f"[{index}/{len(jobs)}] Wrote {job.destination}", flush=True)
+                except Exception as problem:
+                    details = None
+                    status = "failed"
+                    error = str(problem)
+                    if args.fail_fast:
+                        raise
+                results.append(
+                    {
+                        "source": str(job.source),
+                        "destination": str(job.destination),
+                        "status": status,
+                        "elapsed_seconds": round(time.monotonic() - started, 2),
+                        "error": error,
+                        "details": details,
+                    }
+                )
+        else:
+            results.extend(execute_jobs(args, comfy_root, python, jobs))
     manifest = {
-        "workflow": str(profile_configuration(args.profile)[0]),
-        "profile": args.profile,
-        "prompt": str(args.prompt_file.expanduser().resolve()),
+        "engine": args.engine,
+        "workflow": (
+            str(profile_configuration(args.profile)[0]) if args.engine == "qwen" else None
+        ),
+        "profile": args.profile if args.engine == "qwen" else None,
+        "prompt": (
+            str(args.prompt_file.expanduser().resolve()) if args.engine == "qwen" else None
+        ),
         "seed": args.seed,
         "steps": args.steps,
         "input_root": str(input_root),
@@ -825,6 +1051,10 @@ def parser() -> argparse.ArgumentParser:
     add_runtime_paths(simple)
     simple.add_argument("--input-image", type=Path, required=True)
     add_generation_options(simple)
+    simple.add_argument("--engine", choices=ENGINE_NAMES, default="fidelity")
+    simple.add_argument("--generative", dest="engine", action="store_const", const="qwen")
+    simple.add_argument("--max-dimension", type=int, default=1200)
+    simple.add_argument("--demoire", choices=("auto", "esdnet", "filter"), default="auto")
     simple.set_defaults(profile="q4ks", fail_fast=False)
     batch = subparsers.add_parser(
         "batch", help="restore a directory while keeping ComfyUI and models resident"
@@ -835,7 +1065,11 @@ def parser() -> argparse.ArgumentParser:
     add_generation_options(batch)
     batch.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     batch.add_argument("--fail-fast", action="store_true")
-    batch.add_argument("--profile", choices=PROFILE_NAMES, required=True)
+    batch.add_argument("--engine", choices=ENGINE_NAMES, default="fidelity")
+    batch.add_argument("--generative", dest="engine", action="store_const", const="qwen")
+    batch.add_argument("--max-dimension", type=int, default=1200)
+    batch.add_argument("--demoire", choices=("auto", "esdnet", "filter"), default="auto")
+    batch.add_argument("--profile", choices=PROFILE_NAMES, default="q4ks")
     compare = subparsers.add_parser(
         "benchmark", help="restore one slide with both candidate Qwen quantizations"
     )
@@ -848,8 +1082,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    comfy_root = resolve_comfy_root(args.comfyui_dir)
-    python = resolve_python(comfy_root, args.comfyui_python)
+    needs_comfy = args.command not in {"simple", "batch"} or args.engine == "qwen"
+    if needs_comfy:
+        comfy_root = resolve_comfy_root(args.comfyui_dir)
+        python = resolve_python(comfy_root, args.comfyui_python)
+    else:
+        comfy_root = ROOT
+        python = Path(sys.executable)
     if args.command == "doctor":
         profiles = PROFILE_NAMES if args.all_profiles else (args.profile,)
         report = {

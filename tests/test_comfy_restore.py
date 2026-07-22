@@ -20,8 +20,17 @@ class ComfyWorkflowTests(unittest.TestCase):
             ["simple", "--input-image", "originals/manual/IMG_6219.jpeg"]
         )
         self.assertEqual(args.profile, "q4ks")
+        self.assertEqual(args.engine, "fidelity")
+        self.assertEqual(args.max_dimension, 1200)
+        self.assertEqual(args.demoire, "auto")
         self.assertEqual(args.steps, 4)
         self.assertFalse(args.overwrite)
+
+    def test_simple_generative_is_explicit_opt_in(self) -> None:
+        args = comfy_restore.parser().parse_args(
+            ["simple", "--input-image", "input.jpeg", "--generative"]
+        )
+        self.assertEqual(args.engine, "qwen")
 
     def test_simple_destination_uses_caller_directory_and_source_extension(self) -> None:
         destination = comfy_restore.simple_destination(
@@ -41,6 +50,23 @@ class ComfyWorkflowTests(unittest.TestCase):
             with Image.open(destination) as restored:
                 self.assertEqual(restored.format, "JPEG")
                 self.assertEqual(restored.size, (8, 6))
+
+    def test_fidelity_restore_is_non_generative_and_limits_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.png"
+            destination = root / "restored.png"
+            Image.new("RGB", (120, 80), (120, 80, 60)).save(source)
+
+            report = comfy_restore.fidelity_restore_image(
+                source, destination, max_dimension=60, demoire="filter"
+            )
+
+            self.assertEqual(report["engine"], "fidelity")
+            self.assertEqual(report["source_size"], [120, 80])
+            self.assertEqual(report["output_size"], [60, 40])
+            with Image.open(destination) as restored:
+                self.assertEqual(restored.size, (60, 40))
 
     def test_resolve_python_preserves_virtualenv_launcher_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -144,26 +170,20 @@ class BatchSafetyTests(unittest.TestCase):
                 overwrite=False,
                 fail_fast=False,
                 profile="q4ks",
+                engine="fidelity",
+                max_dimension=1600,
+                demoire="filter",
             )
 
-            def completed(_args, _comfy_root, _python, jobs):
-                return [
-                    {
-                        "source": str(job.source),
-                        "destination": str(job.destination),
-                        "status": "completed",
-                        "elapsed_seconds": 1.0,
-                        "error": None,
-                    }
-                    for job in jobs
-                ]
-
-            with patch.object(comfy_restore, "execute_jobs", side_effect=completed) as execute:
+            with patch.object(
+                comfy_restore, "fidelity_restore_image", return_value={"engine": "fidelity"}
+            ) as restore:
                 comfy_restore.restore_batch(args, Path("/unused"), Path("/unused"))
 
-            execute.assert_called_once()
-            jobs = execute.call_args.args[3]
-            destinations = {job.destination.relative_to(output_root) for job in jobs}
+            self.assertEqual(restore.call_count, 2)
+            destinations = {
+                Path(call.args[1]).relative_to(output_root) for call in restore.call_args_list
+            }
             self.assertEqual(
                 destinations,
                 {Path("one_restored.png"), Path("nested/two_restored.png")},

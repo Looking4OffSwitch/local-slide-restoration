@@ -1,13 +1,14 @@
 # Local Slide Restoration
 
-The production path is a local ComfyUI workflow using Qwen-Image-Edit-2511 and
-the official four-step Lightning adapter. It is designed for photographed slides that
-need the mount removed, geometry corrected, capture artifacts cleaned, and the original
-scene restored conservatively.
+The production path is a fidelity-first local workflow for photographed slides. It uses
+only source-derived image operations: conservative edge-mounted border trimming,
+anti-aliased demoiré/downsampling, restrained cast and contrast correction, and mild
+sharpening. It does not run a generative model or face enhancer, so it cannot invent
+faces, text, hands, clothing, or background objects.
 
-The workflow does not run a post-restoration upscaler. Qwen normalizes the source to its
-native working resolution, performs the edit, and saves that result directly. ComfyUI is
-the only restoration engine in this repository.
+The previous Qwen-Image-Edit-2511 workflow remains available as an explicitly generative
+experimental path. It is not the production default because whole-frame diffusion edits
+can replace uncertain historical detail with plausible but unsupported content.
 
 ## Install on the Bazzite RTX 4080 PC
 
@@ -41,11 +42,29 @@ Run the simple command from the directory where the restored image should be wri
 ./run.sh --simple --input-image originals/manual/IMG_6219.jpeg
 ```
 
-This always uses the Q4_K_S ComfyUI profile and writes
+This uses the non-generative fidelity engine and writes
 `IMG_6219_restored.jpeg` to the caller's current directory. The output keeps the source
 extension and contains image data in that actual format. Existing output is refused
 unless `--overwrite` is supplied. Nothing is written inside the protected `originals/`
 archive.
+
+The default maximum output dimension is 1200 pixels. The primary demoiré stage uses the
+pinned Apache-2.0 ESDNet UHDM model, which was trained specifically for camera-captured
+4K screens and does not use a semantic generative prior. If it is unavailable, the runner
+falls back to source-derived low-pass filtering. Override the output size when needed:
+
+```bash
+./run.sh --simple --input-image originals/manual/IMG_6219.jpeg --max-dimension 2400
+```
+
+Use `--demoire esdnet` to require the model and fail instead of falling back, or
+`--demoire filter` to force the deterministic fallback.
+
+To deliberately run the previous Qwen workflow for comparison:
+
+```bash
+./run.sh --simple --generative --input-image originals/manual/IMG_6219.jpeg
+```
 
 ## Compare both model profiles
 
@@ -103,21 +122,23 @@ process:
 
 ```bash
 ./run.sh comfy-batch \
-  --profile q4ks \
   --input-dir /path/to/copied-inputs \
   --output-dir /path/to/restored-output
 ```
 
-Replace `q4ks` with `q4km` if that profile wins the PC comparison. The model remains
-resident for the whole batch instead of being reloaded for every photograph. Discovery
-is recursive, relative subdirectories are preserved, and outputs are named
+This uses the non-generative fidelity engine. Discovery is recursive, relative
+subdirectories are preserved, and outputs are named
 `NAME_restored.png`. Existing results are skipped by default, so the same command resumes
 an interrupted batch. `restoration_manifest.json` records completed, skipped, and failed
 sources with per-image timings. A failed image does not stop the rest unless `--fail-fast`
 is supplied.
 
-Use the benchmark's measured generation time—not a Mac estimate—to project the 600-image
-runtime on the RTX PC.
+The experimental generative batch remains available with `--generative --profile q4ks`
+or `--generative --profile q4km`. Generated outputs must be reviewed individually and
+must not replace the archival fidelity results.
+
+Use the benchmark's measured generation time—not a Mac estimate—to project any
+experimental Qwen batch runtime on the RTX PC.
 
 ## Inspect the ComfyUI graph
 
@@ -164,3 +185,6 @@ performance acceptance are based on the Bazzite RTX 4080 test.
 
 Original code in this repository is available under the MIT License. ComfyUI, custom
 nodes, and model weights retain their own licenses and usage terms.
+
+The optional ESDNet checkout is installed from `CVMI-Lab/UHDM` at a pinned commit and is
+licensed under Apache-2.0. Its checkpoint is stored outside Git under `.slide_pipeline`.

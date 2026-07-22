@@ -5,7 +5,10 @@ description = "A guarded local ComfyUI restoration pipeline for photographed sli
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "numpy>=2.2,<3",
+    "pillow>=11,<13",
+]
 
 [tool.uv]
 package = false
