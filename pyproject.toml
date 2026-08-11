@@ -15,7 +15,7 @@ package = false
 
 [dependency-groups]
 dev = [
-    "coverage>=7.10,<8",
+    "coverage>=7.15.3,<8",
     "pillow>=11,<13",
     "pip-audit>=2.9,<3",
     "pytest>=8.4,<10",
